@@ -1,0 +1,37 @@
+from dataclasses import dataclass
+from decimal import Decimal
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    google_sheet_id: str
+    google_credentials_path: str
+    google_sheet_name: str
+    rapira_usdt_markup: Decimal
+    rate_cache_ttl_seconds: int
+    sheets_refresh_minutes: int
+
+
+def load_config() -> Config:
+    bot_token = os.environ["BOT_TOKEN"]
+    google_sheet_id = os.environ["GOOGLE_SHEET_ID"]
+    google_credentials_path = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+    google_sheet_name = os.environ.get("GOOGLE_SHEET_NAME", "Orders")
+    rapira_usdt_markup = Decimal(os.environ.get("RAPIRA_USDT_MARKUP", "1.045"))
+    rate_cache_ttl_seconds = int(os.environ.get("RATE_CACHE_TTL_SECONDS", "300"))
+    sheets_refresh_minutes = int(os.environ.get("SHEETS_REFRESH_MINUTES", "10"))
+
+    return Config(
+        bot_token=bot_token,
+        google_sheet_id=google_sheet_id,
+        google_credentials_path=google_credentials_path,
+        google_sheet_name=google_sheet_name,
+        rapira_usdt_markup=rapira_usdt_markup,
+        rate_cache_ttl_seconds=rate_cache_ttl_seconds,
+        sheets_refresh_minutes=sheets_refresh_minutes,
+    )

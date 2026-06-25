@@ -1,0 +1,17 @@
+# Secrets
+bot/.env
+bot/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Docker
+bot/credentials.json/
