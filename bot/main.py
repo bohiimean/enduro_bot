@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import load_config
 from handlers import start, rates, orders
 from services.rate_cache import RateCache
+from services.rate_providers.twelvedata import TwelveDataProvider
 from services.sheets import SheetsCache
 
 logging.basicConfig(
@@ -24,6 +25,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     rate_cache = RateCache(ttl_seconds=config.rate_cache_ttl_seconds)
+    usd_provider = TwelveDataProvider(api_key=config.twelvedata_api_key)
     sheets_cache = SheetsCache(
         spreadsheet_id=config.google_sheet_id,
         credentials_path=config.google_credentials_path,
@@ -31,6 +33,7 @@ async def main() -> None:
     )
 
     dp["rate_cache"] = rate_cache
+    dp["usd_provider"] = usd_provider
     dp["sheets_cache"] = sheets_cache
 
     dp.include_router(start.router)
