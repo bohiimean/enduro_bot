@@ -1,6 +1,7 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 ITEMS_PER_PAGE = 5
+_CHANNEL_URL = "https://t.me/vel_moto"
 
 
 def catalog_list_keyboard(
@@ -10,7 +11,7 @@ def catalog_list_keyboard(
     for idx, item in indexed_items:
         название = item.get("название", "—")
         цена = item.get("цена", "")
-        label = f"{название} — {цена}" if цена else название
+        label = название
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"item:{idx}:{list_msg_id}")])
 
     nav = []
@@ -27,6 +28,7 @@ def catalog_list_keyboard(
 
 def item_back_keyboard(page: int, list_msg_id: int, manager_username: str = "") -> InlineKeyboardMarkup:
     buttons = []
+    buttons.append([InlineKeyboardButton(text="Подробнее", url=_CHANNEL_URL)])
     if manager_username:
         buttons.append([InlineKeyboardButton(
             text="📞 Связаться с менеджером",

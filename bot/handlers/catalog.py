@@ -17,7 +17,6 @@ _MAX_DESC_LEN = 900
 def _build_caption(item: dict) -> str:
     название = item.get("название", "—")
     описание = item.get("описание", "")
-    цена = item.get("цена", "—")
 
     if len(описание) > _MAX_DESC_LEN:
         описание = описание[:_MAX_DESC_LEN].rstrip() + "…"
@@ -25,7 +24,6 @@ def _build_caption(item: dict) -> str:
     parts = [f"<b>{название}</b>"]
     if описание:
         parts.append(описание)
-    parts.append(f"💰 <b>{цена}</b>")
     return "\n\n".join(parts)
 
 
