@@ -10,6 +10,9 @@ from handlers import start, rates, orders, catalog
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.rate_cache import RateCache
+from services.rate_providers.base import RateProvider
+from services.rate_providers.fallback import FallbackProvider
+from services.rate_providers.investing import InvestingComProvider
 from services.rate_providers.twelvedata import TwelveDataProvider
 from services.sheets import SheetsCache
 
@@ -27,7 +30,12 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     rate_cache = RateCache(ttl_seconds=config.rate_cache_ttl_seconds)
-    usd_provider = TwelveDataProvider(api_key=config.twelvedata_api_key)
+    usd_provider: RateProvider = InvestingComProvider(chrome_binary=config.chrome_binary_path)
+    if config.twelvedata_api_key:
+        usd_provider = FallbackProvider(primary=usd_provider, secondary=TwelveDataProvider(api_key=config.twelvedata_api_key))
+        logger.info("USD provider: InvestingCom → TwelveData fallback")
+    else:
+        logger.info("USD provider: InvestingCom (no fallback)")
     sheets_cache = SheetsCache(
         spreadsheet_id=config.google_sheet_id,
         credentials_path=config.google_credentials_path,

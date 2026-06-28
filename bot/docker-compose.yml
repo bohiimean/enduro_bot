@@ -3,6 +3,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      - CHROME_BINARY_PATH=/usr/bin/chromium
     volumes:
       - ./credentials.json:/app/credentials.json:ro
     logging:

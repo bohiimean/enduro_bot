@@ -14,7 +14,8 @@ class Config:
     google_sheet_name: str
     google_catalog_sheet_name: str
     rapira_usdt_markup: Decimal
-    twelvedata_api_key: str
+    twelvedata_api_key: str | None
+    chrome_binary_path: str | None
     rate_cache_ttl_seconds: int
     sheets_refresh_minutes: int
     manager_tg_username: str
@@ -27,7 +28,8 @@ def load_config() -> Config:
     google_sheet_name = os.environ.get("GOOGLE_SHEET_NAME", "Orders")
     google_catalog_sheet_name = os.environ.get("GOOGLE_CATALOG_SHEET_NAME", "Лист2")
     rapira_usdt_markup = Decimal(os.environ.get("RAPIRA_USDT_MARKUP", "1.045"))
-    twelvedata_api_key = os.environ["TWELVEDATA_API_KEY"]
+    twelvedata_api_key = os.environ.get("TWELVEDATA_API_KEY") or None
+    chrome_binary_path = os.environ.get("CHROME_BINARY_PATH") or None
     rate_cache_ttl_seconds = int(os.environ.get("RATE_CACHE_TTL_SECONDS", "300"))
     sheets_refresh_minutes = int(os.environ.get("SHEETS_REFRESH_MINUTES", "10"))
     manager_tg_username = os.environ.get("MANAGER_TG_USERNAME", "")
@@ -40,6 +42,7 @@ def load_config() -> Config:
         google_catalog_sheet_name=google_catalog_sheet_name,
         rapira_usdt_markup=rapira_usdt_markup,
         twelvedata_api_key=twelvedata_api_key,
+        chrome_binary_path=chrome_binary_path,
         rate_cache_ttl_seconds=rate_cache_ttl_seconds,
         sheets_refresh_minutes=sheets_refresh_minutes,
         manager_tg_username=manager_tg_username,
