@@ -6,7 +6,7 @@ router = Router()
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💱 Курс валют")],
+        [KeyboardButton(text="💱 Купить Юань")],
         [KeyboardButton(text="📦 Статус заказа")],
         [KeyboardButton(text="🛍 Каталог товаров")],
     ],
