@@ -84,11 +84,11 @@ async def cmd_rates(
     lines = [
         f"💱 <b>Курс на {date_str} ({day}, {time_str})</b>",
         "",
-        "QR-оплата (Юань/RUB):",
+        "QR-оплата (Юань/Руб):",
         f"→ {_fmt(_yuan_result(usdt_entry.rate))} ₽",
         "",
         "Наличные в Москве (Юань/Руб):",
-        f"→ Стандарт: {_fmt(_usd_result(base_usd, usd_info.standard.markup))} ₽",
+        f"→ Любая сумма — {_fmt(_usd_result(base_usd, usd_info.standard.markup))} ₽",
     ]
 
     for tier in usd_info.discount_tiers:
@@ -99,8 +99,8 @@ async def cmd_rates(
 
     lines.extend([
         "",
-        "Курс доллара скачет каждую секунду и не фиксируется до момента передачи денег.",
-        "(самый лучший курс в будний день до обеда)",
+        "<i>Курс доллара скачет каждую секунду и не фиксируется до момента передачи денег.",
+        "Самый лучший курс в будний день до обеда.</i>",
         "",
         f"Место и время сделки поможет выбрать {manager_link}.",
     ])

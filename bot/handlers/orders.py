@@ -17,7 +17,7 @@ _ask_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-_MENU_BUTTONS = {"💱 Курс валют", "📦 Статус заказа", "🛍 Каталог товаров"}
+_MENU_BUTTONS = {"💱 Купить Юань", "📦 Статус заказа", "🛍 Каталог товаров"}
 
 
 @router.message(F.text == "📦 Статус заказа")
@@ -60,13 +60,13 @@ async def handle_phone(message: Message, state: FSMContext, sheets_cache: Sheets
         brand = order.get("Марка", "—")
         model = order.get("Модель", "—")
         color = order.get("Цвет", "—")
-        price = order.get("Цена", "—")
+        price = order.get("Остаток", "—")
         status = order.get("Статус поставки") or "—"
         date = order.get("дата") or "—"
 
         lines.append("")
         lines.append(f"<b>{i}. {brand} {model} — {color}</b>")
-        lines.append(f"Цена: {price} ₽")
+        lines.append(f"Остаток: {price}")
         lines.append(f"Статус: {status}")
         lines.append(f"Дата заказа: {date}")
 
