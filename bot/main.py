@@ -13,6 +13,7 @@ from services.rate_cache import RateCache
 from services.rate_providers.base import RateProvider
 from services.rate_providers.fallback import FallbackProvider
 from services.rate_providers.investing import InvestingComProvider
+from services.rate_providers.rapira import RapiraProvider
 from services.rate_providers.twelvedata import TwelveDataProvider
 from services.sheets import SheetsCache
 
@@ -30,6 +31,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     rate_cache = RateCache(ttl_seconds=config.rate_cache_ttl_seconds)
+    rapira_provider = RapiraProvider()
     usd_provider: RateProvider = InvestingComProvider(chrome_binary=config.chrome_binary_path)
     if config.twelvedata_api_key:
         usd_provider = FallbackProvider(primary=usd_provider, secondary=TwelveDataProvider(api_key=config.twelvedata_api_key))
@@ -74,7 +76,23 @@ async def main() -> None:
         trigger="interval",
         minutes=config.sheets_refresh_minutes,
     )
+    scheduler.add_job(
+        rate_cache.get,
+        trigger="interval",
+        minutes=20,
+        args=["usdt_rub", rapira_provider],
+    )
+    scheduler.add_job(
+        rate_cache.get,
+        trigger="interval",
+        minutes=20,
+        args=["usd_rub", usd_provider],
+    )
     scheduler.start()
+
+    logger.info("Pre-warming rate cache...")
+    asyncio.create_task(rate_cache.get("usdt_rub", rapira_provider))
+    asyncio.create_task(rate_cache.get("usd_rub", usd_provider))
 
     logger.info("Starting bot (long polling)")
     try:

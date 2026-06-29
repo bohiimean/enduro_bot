@@ -16,7 +16,7 @@ router = Router()
 _rapira = RapiraProvider()
 _CACHE_KEY_USDT = "usdt_rub"
 _CACHE_KEY_USD = "usd_rub"
-_TTL_STALE_WARN = 600
+_TTL_STALE_WARN = 1800
 _FACTOR = Decimal("1") / Decimal("6.7")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
