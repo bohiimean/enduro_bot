@@ -14,6 +14,9 @@ _SELECTOR = '[data-test="instrument-price-last"]'
 _URL = "https://www.investing.com/currencies/usd-rub"
 
 
+_CONSENT_SELECTOR = "#onetrust-accept-btn-handler"
+
+
 def _fetch_sync(chrome_binary: str | None) -> Decimal:
     kwargs: dict = dict(
         uc=True,
@@ -24,6 +27,11 @@ def _fetch_sync(chrome_binary: str | None) -> Decimal:
         kwargs["binary_location"] = chrome_binary
     with SB(**kwargs) as sb:
         sb.open(_URL)
+        try:
+            sb.click(_CONSENT_SELECTOR, timeout=8)
+            logger.info("InvestingCom: consent popup accepted")
+        except Exception:
+            pass
         sb.wait_for_element(_SELECTOR, timeout=15)
         text = sb.get_text(_SELECTOR).strip().replace(",", ".")
         rate = Decimal(text)
