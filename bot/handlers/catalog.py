@@ -2,6 +2,7 @@ import logging
 import math
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from keyboards.inline import ITEMS_PER_PAGE, catalog_list_keyboard, item_back_keyboard
@@ -80,13 +81,17 @@ async def cb_catalog_back(query: CallbackQuery, catalog_cache: CatalogCache) -> 
     total_pages = max(1, math.ceil(len(items) / ITEMS_PER_PAGE))
     page = max(1, min(page, total_pages))
     keyboard = catalog_list_keyboard(_page_items(items, page), page, total_pages, list_msg_id)
-    await query.bot.edit_message_text(
-        _build_list_text(page, total_pages),
-        chat_id=query.message.chat.id,
-        message_id=list_msg_id,
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
+    try:
+        await query.bot.edit_message_text(
+            _build_list_text(page, total_pages),
+            chat_id=query.message.chat.id,
+            message_id=list_msg_id,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 
 @router.callback_query(F.data.startswith("item:"))
