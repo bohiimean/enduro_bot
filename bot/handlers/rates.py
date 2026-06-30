@@ -82,25 +82,28 @@ async def cmd_rates(
     time_str = moscow.strftime("%H:%M")
 
     lines = [
-        f"💱 <b>Курс на {date_str} ({day}, {time_str})</b>",
+        f"💱 <b><u>Курс на {date_str} ({day}, {time_str})</u></b>",
         "",
-        "QR-оплата (Юань/Руб):",
+        "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(_yuan_result(usdt_entry.rate))} ₽",
         "",
-        "Наличные в Москве (Юань/Руб):",
+        "<b>Наличные в Москве</b>",
+        "+ дистанционное снятие по QR с вашего банка.",
+        "(Юань/Руб):",
         f"→ Любая сумма — {_fmt(_usd_result(base_usd, usd_info.standard.markup))} ₽",
+        "",
+        "<b>VIP курс действует с 12:30 до 16:00 в будний день</b>",
     ]
 
     for tier in usd_info.discount_tiers:
-        lines.append(f"→ {tier.label}(до обеда) — {_fmt(_usd_result(base_usd, tier.markup))} ₽")
+        lines.append(f"→ {tier.label} — {_fmt(_usd_result(base_usd, tier.markup))} ₽")
 
     username = manager_tg_username.lstrip("@")
     manager_link = f'<a href="https://t.me/{username}">менеджер</a>' if username else "менеджер"
 
     lines.extend([
         "",
-        "<i>Курс доллара скачет каждую секунду и не фиксируется до момента передачи денег.",
-        "Самый лучший курс в будний день до обеда.</i>",
+        "<i>(Курс доллара скачет каждую секунду и не фиксируется до момента передачи денег)</i>",
         "",
         f"Место и время сделки поможет выбрать {manager_link}.",
     ])

@@ -34,8 +34,8 @@ def get_usd_rate_info(now: datetime) -> UsdRateInfo:
     return UsdRateInfo(
         standard=MarkupTier("Стандарт", Decimal("2.6")),
         discount_tiers=[
-            MarkupTier("от 300 000 ₽ (до обеда)", Decimal("2.1")),
-            MarkupTier("от 500 000 ₽ (до обеда)", Decimal("1.7")),
-            MarkupTier("от 1 000 000 ₽ (до обеда)", Decimal("1.5")),
+            MarkupTier("от 300 000 ₽", Decimal("2.1")),
+            MarkupTier("от 500 000 ₽", Decimal("1.7")),
+            MarkupTier("от 1 000 000 ₽", Decimal("1.5")),
         ],
     )
