@@ -15,3 +15,5 @@ venv/
 
 # Docker
 bot/credentials.json/
+
+CLAUDE.md
