@@ -30,7 +30,7 @@ async def main() -> None:
     bot = Bot(token=config.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
 
-    rate_cache = RateCache(ttl_seconds=config.rate_cache_ttl_seconds)
+    rate_cache = RateCache()
     rapira_provider = RapiraProvider()
     usd_provider: RateProvider = InvestingComProvider(chrome_binary=config.chrome_binary_path)
     if config.twelvedata_api_key:
@@ -38,6 +38,8 @@ async def main() -> None:
         logger.info("USD provider: InvestingCom → TwelveData fallback")
     else:
         logger.info("USD provider: InvestingCom (no fallback)")
+    rate_cache.register("usdt_rub", rapira_provider)
+    rate_cache.register("usd_rub", usd_provider)
     sheets_cache = SheetsCache(
         spreadsheet_id=config.google_sheet_id,
         credentials_path=config.google_credentials_path,
@@ -51,7 +53,6 @@ async def main() -> None:
     drive_cache = DrivePhotoCache(credentials_path=config.google_credentials_path)
 
     dp["rate_cache"] = rate_cache
-    dp["usd_provider"] = usd_provider
     dp["sheets_cache"] = sheets_cache
     dp["catalog_cache"] = catalog_cache
     dp["drive_cache"] = drive_cache
@@ -63,7 +64,12 @@ async def main() -> None:
     dp.include_router(catalog.router)
 
     logger.info("Loading initial data...")
-    await asyncio.gather(sheets_cache.refresh(), catalog_cache.refresh())
+    await asyncio.gather(
+        sheets_cache.refresh(),
+        catalog_cache.refresh(),
+        rate_cache.refresh("usdt_rub"),
+        rate_cache.refresh("usd_rub"),
+    )
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -77,22 +83,18 @@ async def main() -> None:
         minutes=config.sheets_refresh_minutes,
     )
     scheduler.add_job(
-        rate_cache.get,
+        rate_cache.refresh,
         trigger="interval",
         minutes=20,
-        args=["usdt_rub", rapira_provider],
+        args=["usdt_rub"],
     )
     scheduler.add_job(
-        rate_cache.get,
+        rate_cache.refresh,
         trigger="interval",
         minutes=20,
-        args=["usd_rub", usd_provider],
+        args=["usd_rub"],
     )
     scheduler.start()
-
-    logger.info("Pre-warming rate cache...")
-    asyncio.create_task(rate_cache.get("usdt_rub", rapira_provider))
-    asyncio.create_task(rate_cache.get("usd_rub", usd_provider))
 
     logger.info("Starting bot (long polling)")
     try:

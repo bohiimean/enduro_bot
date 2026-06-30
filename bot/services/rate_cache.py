@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -16,24 +15,22 @@ class CacheEntry:
 
 
 class RateCache:
-    def __init__(self, ttl_seconds: int):
-        self._ttl = ttl_seconds
+    def __init__(self) -> None:
         self._store: dict[str, CacheEntry] = {}
-        self._lock = asyncio.Lock()
+        self._providers: dict[str, RateProvider] = {}
 
-    async def get(self, key: str, provider: RateProvider) -> CacheEntry:
-        async with self._lock:
-            entry = self._store.get(key)
-            if entry and time.time() - entry.fetched_at < self._ttl:
-                return entry
-            try:
-                rate = await provider.get_rate()
-                entry = CacheEntry(rate=rate, fetched_at=time.time())
-                self._store[key] = entry
-                return entry
-            except Exception:
-                logger.exception("Failed to refresh rate for key=%s", key)
-                if entry:
-                    # возвращаем устаревшее значение, не роняем хендлер
-                    return entry
-                raise
+    def register(self, key: str, provider: RateProvider) -> None:
+        self._providers[key] = provider
+
+    async def refresh(self, key: str) -> None:
+        provider = self._providers[key]
+        try:
+            rate = await provider.get_rate()
+        except Exception:
+            logger.exception("Failed to refresh rate for key=%s", key)
+            return
+        self._store[key] = CacheEntry(rate=rate, fetched_at=time.time())
+        logger.info("Rate refreshed: %s=%s", key, rate)
+
+    def get(self, key: str) -> CacheEntry | None:
+        return self._store.get(key)
