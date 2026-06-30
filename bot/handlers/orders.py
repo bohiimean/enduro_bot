@@ -64,11 +64,20 @@ async def handle_phone(message: Message, state: FSMContext, sheets_cache: Sheets
         status = order.get("Статус поставки") or "—"
         date = order.get("дата") or "—"
 
+        name = order.get("ФИО", "—")
+        phone = order.get("Телефон", "—")
+        city = order.get("Город", "—")
+        tk = order.get("ТК", "—")
+
         lines.append("")
         lines.append(f"<b>{i}. {brand} {model} — {color}</b>")
-        lines.append(f"Остаток: {price}")
-        lines.append(f"Статус: {status}")
-        lines.append(f"Дата заказа: {date}")
+        lines.append(f"<b>ФИО:</b> {name}")
+        lines.append(f"<b>Телефон:</b> {phone}")
+        lines.append(f"<b>Город:</b> {city}")
+        lines.append(f"<b>ТК:</b> {tk}")
+        lines.append(f"<b>Остаток:</b> {price}")
+        lines.append(f"<b>Статус:</b> {status}")
+        lines.append(f"<b>Дата заказа:</b> {date}")
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_keyboard)
 
