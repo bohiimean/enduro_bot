@@ -30,7 +30,7 @@ def _build_caption(item: dict) -> str:
 
 
 def _build_list_text(page: int, total_pages: int) -> str:
-    return f"🛍 <b>Каталог товаров</b> — стр. {page}/{total_pages}\nВыберите товар:"
+    return f"🛍 <b>Байки в наличии в Москве</b> — стр. {page}/{total_pages}\nВыберите товар:"
 
 
 def _page_items(items: list[dict], page: int) -> list[tuple[int, dict]]:
@@ -38,7 +38,7 @@ def _page_items(items: list[dict], page: int) -> list[tuple[int, dict]]:
     return list(enumerate(items))[start : start + ITEMS_PER_PAGE]
 
 
-@router.message(F.text == "🛍 Каталог товаров")
+@router.message(F.text == "🛍 Байки в наличии в Москве")
 async def cmd_catalog(message: Message, catalog_cache: CatalogCache) -> None:
     items = catalog_cache.all_items()
     if not items:

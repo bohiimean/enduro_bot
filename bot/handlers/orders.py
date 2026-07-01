@@ -17,7 +17,7 @@ _ask_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-_MENU_BUTTONS = {"💱 Купить Юань", "📦 Статус заказа", "🛍 Каталог товаров"}
+_MENU_BUTTONS = {"💱 Купить Юань", "📦 Статус заказа", "🛍 Байки в наличии в Москве"}
 
 
 @router.message(F.text == "📦 Статус заказа")
