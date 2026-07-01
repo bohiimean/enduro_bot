@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,11 @@ _POPUP_SELECTORS = [
     "#PromoteSignUpPopUp .close",
 ]
 
+_CHROMIUM_ARGS = (
+    "--no-sandbox --disable-dev-shm-usage --disable-gpu "
+    "--disable-extensions --blink-settings=imagesEnabled=false"
+)
+
 
 def _sys_stats() -> str:
     mem = psutil.virtual_memory()
@@ -34,107 +40,110 @@ def _sys_stats() -> str:
     return f"CPU={cpu:.0f}% RAM={mem.used // 1024 // 1024}MB/{mem.total // 1024 // 1024}MB"
 
 
+def _kill_orphans() -> None:
+    try:
+        me = psutil.Process(os.getpid())
+        targets = []
+        for child in me.children(recursive=True):
+            try:
+                name = child.name().lower()
+                if "chrome" in name or "driver" in name:
+                    targets.append(child)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if not targets:
+            return
+        for p in targets:
+            try:
+                p.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(targets, timeout=3)
+        for p in alive:
+            try:
+                p.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        logger.info("InvestingCom: cleaned %d chrome/driver process(es)", len(targets))
+    except Exception:
+        logger.exception("InvestingCom: kill_orphans failed")
+
+
 class InvestingComProvider(RateProvider):
     def __init__(self, chrome_binary: str | None = None):
         self._chrome_binary = chrome_binary
-        self._cm = None
-        self._sb: SB | None = None
         self._lock = threading.Lock()
 
-    def _start(self) -> None:
-        logger.info("InvestingCom: starting browser [%s]", _sys_stats())
-        t0 = time.monotonic()
-        kwargs: dict = dict(
-            uc=True,
-            headless=True,
-            chromium_arg="--no-sandbox --disable-dev-shm-usage",
-        )
+    def _sb_kwargs(self) -> dict:
+        kwargs: dict = dict(uc=True, headless=True, chromium_arg=_CHROMIUM_ARGS)
         if self._chrome_binary:
             kwargs["binary_location"] = self._chrome_binary
-        self._cm = SB(**kwargs)
-        self._sb = self._cm.__enter__()
-        logger.info(
-            "InvestingCom: browser started in %.1fs [%s]",
-            time.monotonic() - t0,
-            _sys_stats(),
-        )
+        return kwargs
 
-    def _alive(self) -> bool:
-        if self._sb is None:
-            return False
-        try:
-            _ = self._sb.get_current_url()
-            return True
-        except Exception:
-            return False
-
-    def _dismiss_popups(self) -> None:
+    @staticmethod
+    def _dismiss_popups(sb) -> None:
         for sel in _POPUP_SELECTORS:
             try:
-                self._sb.click(sel, timeout=3)
+                sb.click(sel, timeout=3)
                 logger.info("InvestingCom: dismissed popup [%s]", sel)
                 return
             except Exception:
                 pass
 
-    def _screenshot(self) -> None:
+    @staticmethod
+    def _screenshot(sb) -> None:
         try:
-            self._sb.save_screenshot(_SCREENSHOT_PATH)
+            sb.save_screenshot(_SCREENSHOT_PATH)
             logger.info("InvestingCom: debug screenshot → %s", _SCREENSHOT_PATH)
         except Exception:
             pass
 
-    def _reset(self) -> None:
-        try:
-            if self._cm is not None:
-                self._cm.__exit__(None, None, None)
-        except Exception:
-            logger.exception("InvestingCom: teardown failed")
-        finally:
-            self._cm = None
-            self._sb = None
-            logger.info("InvestingCom: browser reset [%s]", _sys_stats())
-
     def _fetch_once(self, retry: bool = True) -> Decimal:
-        if not self._alive():
-            self._reset()
-            self._start()
-
         t0 = time.monotonic()
+        logger.info("InvestingCom: starting browser [%s]", _sys_stats())
         try:
-            self._sb.open(_URL)
-            self._dismiss_popups()
-            self._sb.wait_for_element(_SELECTOR, timeout=20)
-            text = self._sb.get_text(_SELECTOR).strip().replace(",", ".")
-            rate = Decimal(text)
-            logger.info(
-                "InvestingCom: USD/RUB=%s in %.1fs [%s]",
-                rate,
-                time.monotonic() - t0,
-                _sys_stats(),
-            )
-            return rate
+            with SB(**self._sb_kwargs()) as sb:
+                logger.info(
+                    "InvestingCom: browser started in %.1fs [%s]",
+                    time.monotonic() - t0,
+                    _sys_stats(),
+                )
+                try:
+                    sb.open(_URL)
+                    self._dismiss_popups(sb)
+                    sb.wait_for_element(_SELECTOR, timeout=20)
+                    text = sb.get_text(_SELECTOR).strip().replace(",", ".")
+                    rate = Decimal(text)
+                    logger.info(
+                        "InvestingCom: USD/RUB=%s in %.1fs [%s]",
+                        rate,
+                        time.monotonic() - t0,
+                        _sys_stats(),
+                    )
+                    return rate
+                except Exception:
+                    self._screenshot(sb)
+                    raise
         except NoSuchWindowException:
             logger.warning(
                 "InvestingCom: window closed unexpectedly [%s]%s",
                 _sys_stats(),
-                ", restarting" if retry else ", giving up",
+                ", retrying" if retry else ", giving up",
             )
-            self._reset()
             if retry:
                 return self._fetch_once(retry=False)
             raise
         except Exception:
-            self._screenshot()
             logger.warning(
-                "InvestingCom: fetch failed after %.1fs [%s], resetting browser",
+                "InvestingCom: fetch failed after %.1fs [%s]",
                 time.monotonic() - t0,
                 _sys_stats(),
             )
-            self._reset()
             if retry:
                 return self._fetch_once(retry=False)
             raise
+        finally:
+            _kill_orphans()
 
     def _fetch_sync(self) -> Decimal:
         with self._lock:
