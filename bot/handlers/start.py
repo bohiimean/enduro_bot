@@ -8,7 +8,7 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💱 Купить Юань")],
         [KeyboardButton(text="📦 Статус заказа")],
-        [KeyboardButton(text="🛍 Каталог товаров")],
+        [KeyboardButton(text="🛍 Байки в наличии в Москве")],
     ],
     resize_keyboard=True,
 )
