@@ -14,6 +14,8 @@ def catalog_list_keyboard(
         label = название
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"item:{idx}:{list_msg_id}")])
 
+    buttons.append([InlineKeyboardButton(text="🏠 В меню", callback_data="cat:menu")])
+
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton(text="←", callback_data=f"cat:page:{page - 1}"))

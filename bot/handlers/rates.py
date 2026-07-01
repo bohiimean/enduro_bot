@@ -14,6 +14,7 @@ router = Router()
 _CACHE_KEY_USDT = "usdt_rub"
 _CACHE_KEY_USD = "usd_rub"
 _TTL_STALE_WARN = 1800
+_USDT_MAX_AGE = 180
 _FACTOR = Decimal("1") / Decimal("6.7")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -58,6 +59,7 @@ async def cmd_rates(
     anim_task = asyncio.create_task(_animate_loading(loading))
 
     try:
+        await rate_cache.refresh(_CACHE_KEY_USDT, max_age_seconds=_USDT_MAX_AGE)
         usdt_entry = rate_cache.get(_CACHE_KEY_USDT)
         usd_entry = rate_cache.get(_CACHE_KEY_USD)
     finally:

@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+from handlers.start import main_keyboard
 from keyboards.inline import ITEMS_PER_PAGE, catalog_list_keyboard, item_back_keyboard
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
@@ -129,6 +130,13 @@ async def cb_item(
             logger.exception("Failed to load photo for item %s", idx)
 
     await query.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "cat:menu")
+async def cb_catalog_menu(query: CallbackQuery) -> None:
+    await query.answer()
+    await query.message.delete()
+    await query.message.answer("Выберите действие:", reply_markup=main_keyboard)
 
 
 @router.callback_query(F.data == "noop")
