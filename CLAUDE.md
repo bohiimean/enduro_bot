@@ -213,6 +213,14 @@ GOOGLE_CREDENTIALS_PATH=
 RAPIRA_USDT_MARKUP=1.045
 RATE_CACHE_TTL_SECONDS=300
 SHEETS_REFRESH_MINUTES=10
+
+# Alfabit (приём рублей по СБП + KYC) — фича включается только если заданы ключи
+ALFABIT_API_KEY=
+ALFABIT_SECRET_KEY=
+ALFABIT_BASE_URL=https://alfabit.org
+ALFABIT_RATE_DIRECTION=sell      # buy/sell — уточнить
+ALFABIT_USDT_MARKUP=1.0          # доп. наценка сверх спреда alfabit
+ALFABIT_PAYER_IP_FALLBACK=       # заглушка: у бота нет реального IP плательщика
 ```
 
 ---
@@ -252,6 +260,40 @@ services:
 - Логи — стандартный `logging` в stdout, Docker сам пишет их через `json-file` driver (лимиты выше не дают логам разрастаться бесконечно — отдельный logrotate не нужен).
 - Перезапуск при падении — `restart: unless-stopped`. Отдельный systemd-юнит не нужен; если на сервере уже настроен автозапуск Docker при перезагрузке — `docker compose up -d` достаточно.
 - Webhook/nginx/SSL всё ещё не нужны — long polling работает из контейнера так же, как из обычного процесса.
+
+---
+
+## Приём оплаты через Alfabit (QR + KYC) — в разработке
+
+Цель: принимать **рубли по СБП с верификацией плательщика (KYC)** за продажу юаня. Реализуется в ветке `feat/alfabit-qr-kyc`. Сервис — [alfabit.org integration API](https://alfabit.org/ru/api-docs).
+
+**Что делает метод.** Alfabit выступает эквайером: генерирует QR/реквизиты СБП, принимает рубли на баланс аккаунта, KYC сверяет ФИО плательщика. Выдачу юаня бот по-прежнему делает сам после подтверждения оплаты — метод закрывает только приём рублей.
+
+**Авторизация.** Все запросы подписываются HMAC-SHA256. Заголовки `X-API-Key` / `X-API-Signature` / `X-API-Timestamp`, где `message = "{timestamp}{METHOD}{path}{body}"`, timestamp живёт 5 минут. Ключи `pk_live_*` / `sk_live_*` из кабинета alfabit.
+
+**Ключевые эндпоинты:**
+- `GET /api/v1/integration/converter/fiat/rate?crypto=USDT&fiat=RUB&direction=sell` — курс USDT/RUB «обменник» (со спредом alfabit). Используется для строки курса QR+KYC.
+- `POST /api/v1/integration/checkout/payments` — создать RUB-платёж. Если плательщик не верифицирован → `status=kyc_required`.
+- `POST /api/v1/integration/checkout/payers/{phone}/documents` — загрузка фото паспорта (multipart), KYC. Ключ верификации — телефон, проверяется один раз.
+- `GET /api/v1/integration/checkout/payers/{phone}` — статус KYC (`not_started|pending|approved|rejected`), отдаёт `expected_payer_name`.
+- `GET /api/v1/integration/checkout/payments/{uid}` — статус платежа + `qr_url`/`qr_payload`.
+
+**Решения:**
+- **Поллинг вместо webhook** — webhook требует публичный HTTPS-эндпоинт (противоречит «no nginx»). Пользователь жмёт «✅ Я оплатил» → бот дёргает `GET .../payments/{uid}`.
+- **БД не нужна** — `payment_uid` кодируется прямо в `callback_data` кнопки (как в каталоге), состояние на сервере не хранится. Опционально: аудит-лог оплат в отдельный лист Google Sheets.
+- Курс alfabit включается **только при наличии ключей** — без них бот работает как раньше.
+
+**Сделано (коммит на ветке):** `services/alfabit/client.py` (подписанный клиент), `services/rate_providers/alfabit.py` (провайдер USDT/RUB), переменные `ALFABIT_*` в config, строка «QR + KYC» в `handlers/rates.py`.
+
+**НЕ сделано:** платёжный FSM-хендлер (сумма → телефон → создать платёж → загрузка паспорта + поллинг KYC → QR → «Я оплатил»).
+
+**OPEN QUESTIONS (блокеры, нужны реальные ключи / ответ alfabit):**
+- `payer_ip` — обязательное антифрод-поле, а у Telegram-бота нет IP плательщика. Уточнить у alfabit, что слать.
+- Входит ли query-строка в подпись GET-запроса (в доках неоднозначно).
+- Как подписывается multipart-загрузка документов.
+- `direction` (buy/sell) и итоговая наценка `ALFABIT_USDT_MARKUP` — подтвердить бизнес-значения.
+
+**Отдельно — крипто-инвойсы** (`/api/v2/integration/invoices`): приём криптовалюты без KYC, проще checkout. Пока не используем, зафиксировано как альтернатива.
 
 ---
 
