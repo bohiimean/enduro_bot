@@ -13,6 +13,7 @@ router = Router()
 
 _CACHE_KEY_USDT = "usdt_rub"
 _CACHE_KEY_USD = "usd_rub"
+_CACHE_KEY_ALFABIT = "usdt_rub_alfabit"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
 _FACTOR = Decimal("1") / Decimal("6.67")
@@ -60,8 +61,11 @@ async def cmd_rates(
 
     try:
         await rate_cache.refresh(_CACHE_KEY_USDT, max_age_seconds=_USDT_MAX_AGE)
+        if rate_cache.is_registered(_CACHE_KEY_ALFABIT):
+            await rate_cache.refresh(_CACHE_KEY_ALFABIT, max_age_seconds=_USDT_MAX_AGE)
         usdt_entry = rate_cache.get(_CACHE_KEY_USDT)
         usd_entry = rate_cache.get(_CACHE_KEY_USD)
+        alfabit_entry = rate_cache.get(_CACHE_KEY_ALFABIT)
     finally:
         anim_task.cancel()
         try:
@@ -88,6 +92,17 @@ async def cmd_rates(
         "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(_yuan_result(usdt_entry.rate))} ₽",
         "",
+    ]
+
+    if alfabit_entry is not None:
+        lines += [
+            "<b>QR + KYC (верификация по фото паспорта)</b>",
+            "(Юань/Руб):",
+            f"→ {_fmt(_yuan_result(alfabit_entry.rate))} ₽",
+            "",
+        ]
+
+    lines += [
         "<b>Наличные в Москве</b>",
         "+ дистанционное снятие по QR с вашего банка.",
         "(Юань/Руб):",

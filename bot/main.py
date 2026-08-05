@@ -9,7 +9,9 @@ from config import load_config
 from handlers import start, rates, orders, catalog
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
+from services.alfabit.client import AlfabitClient
 from services.rate_cache import RateCache
+from services.rate_providers.alfabit import AlfabitProvider
 from services.rate_providers.base import RateProvider
 from services.rate_providers.fallback import FallbackProvider
 from services.rate_providers.investing import InvestingComProvider
@@ -40,6 +42,27 @@ async def main() -> None:
         logger.info("USD provider: InvestingCom (no fallback)")
     rate_cache.register("usdt_rub", rapira_provider)
     rate_cache.register("usd_rub", usd_provider)
+
+    # Alfabit «обменник» USDT/RUB — источник для строки QR+KYC. Подключается
+    # только если заданы ключи; иначе строка QR+KYC просто не показывается.
+    alfabit_client: AlfabitClient | None = None
+    if config.alfabit_api_key and config.alfabit_secret_key:
+        alfabit_client = AlfabitClient(
+            api_key=config.alfabit_api_key,
+            secret_key=config.alfabit_secret_key,
+            base_url=config.alfabit_base_url,
+        )
+        rate_cache.register(
+            "usdt_rub_alfabit",
+            AlfabitProvider(
+                alfabit_client,
+                direction=config.alfabit_rate_direction,
+                markup=config.alfabit_usdt_markup,
+            ),
+        )
+        logger.info("Alfabit provider registered (usdt_rub_alfabit)")
+    else:
+        logger.info("Alfabit keys not set — QR+KYC rate disabled")
     sheets_cache = SheetsCache(
         spreadsheet_id=config.google_sheet_id,
         credentials_path=config.google_credentials_path,
@@ -57,6 +80,7 @@ async def main() -> None:
     dp["catalog_cache"] = catalog_cache
     dp["drive_cache"] = drive_cache
     dp["manager_tg_username"] = config.manager_tg_username
+    dp["alfabit_client"] = alfabit_client
 
     dp.include_router(start.router)
     dp.include_router(rates.router)
@@ -64,12 +88,15 @@ async def main() -> None:
     dp.include_router(catalog.router)
 
     logger.info("Loading initial data...")
-    await asyncio.gather(
+    initial_tasks = [
         sheets_cache.refresh(),
         catalog_cache.refresh(),
         rate_cache.refresh("usdt_rub"),
         rate_cache.refresh("usd_rub"),
-    )
+    ]
+    if alfabit_client is not None:
+        initial_tasks.append(rate_cache.refresh("usdt_rub_alfabit"))
+    await asyncio.gather(*initial_tasks)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
@@ -94,6 +121,13 @@ async def main() -> None:
         minutes=20,
         args=["usd_rub"],
     )
+    if alfabit_client is not None:
+        scheduler.add_job(
+            rate_cache.refresh,
+            trigger="interval",
+            minutes=20,
+            args=["usdt_rub_alfabit"],
+        )
     scheduler.start()
 
     logger.info("Starting bot (long polling)")

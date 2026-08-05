@@ -25,6 +25,9 @@ class RateCache:
         self._providers[key] = provider
         self._locks[key] = asyncio.Lock()
 
+    def is_registered(self, key: str) -> bool:
+        return key in self._providers
+
     async def refresh(self, key: str, max_age_seconds: float | None = None) -> None:
         lock = self._locks[key]
         async with lock:

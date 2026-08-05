@@ -18,6 +18,12 @@ class Config:
     chrome_binary_path: str | None
     sheets_refresh_minutes: int
     manager_tg_username: str
+    alfabit_api_key: str | None
+    alfabit_secret_key: str | None
+    alfabit_base_url: str
+    alfabit_rate_direction: str
+    alfabit_usdt_markup: Decimal
+    alfabit_payer_ip_fallback: str
 
 
 def load_config() -> Config:
@@ -31,6 +37,14 @@ def load_config() -> Config:
     chrome_binary_path = os.environ.get("CHROME_BINARY_PATH") or None
     sheets_refresh_minutes = int(os.environ.get("SHEETS_REFRESH_MINUTES", "10"))
     manager_tg_username = os.environ.get("MANAGER_TG_USERNAME", "")
+    alfabit_api_key = os.environ.get("ALFABIT_API_KEY") or None
+    alfabit_secret_key = os.environ.get("ALFABIT_SECRET_KEY") or None
+    alfabit_base_url = os.environ.get("ALFABIT_BASE_URL", "https://alfabit.org")
+    alfabit_rate_direction = os.environ.get("ALFABIT_RATE_DIRECTION", "sell")
+    alfabit_usdt_markup = Decimal(os.environ.get("ALFABIT_USDT_MARKUP", "1.0"))
+    # У Telegram-бота нет реального IP плательщика, а checkout требует payer_ip.
+    # Временная заглушка до выяснения у alfabit, что слать (см. OPEN QUESTIONS).
+    alfabit_payer_ip_fallback = os.environ.get("ALFABIT_PAYER_IP_FALLBACK", "")
 
     return Config(
         bot_token=bot_token,
@@ -43,4 +57,10 @@ def load_config() -> Config:
         chrome_binary_path=chrome_binary_path,
         sheets_refresh_minutes=sheets_refresh_minutes,
         manager_tg_username=manager_tg_username,
+        alfabit_api_key=alfabit_api_key,
+        alfabit_secret_key=alfabit_secret_key,
+        alfabit_base_url=alfabit_base_url,
+        alfabit_rate_direction=alfabit_rate_direction,
+        alfabit_usdt_markup=alfabit_usdt_markup,
+        alfabit_payer_ip_fallback=alfabit_payer_ip_fallback,
     )
