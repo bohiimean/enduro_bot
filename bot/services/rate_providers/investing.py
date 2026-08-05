@@ -19,6 +19,16 @@ _SELECTOR = '[data-test="instrument-price-last"]'
 _URL = "https://www.investing.com/currencies/usd-rub"
 _SCREENSHOT_PATH = "/tmp/investing_fail.png"
 
+# Один зависший Selenium-вызов навсегда занимает единственный поток пула и
+# threading.Lock, из-за чего usd_rub переставал обновляться до рестарта контейнера.
+# _BROWSER_HARD_TIMEOUT — сколько ждём одну попытку, прежде чем убить chrome
+# (это заставляет зависший вызов упасть и освободить поток → само-восстановление).
+# _GET_RATE_TIMEOUT — общий предел на async-стороне (покрывает обе попытки).
+# Нормальный скрап investing.com долгий: первый ~3 мин, последующие ~2 мин.
+# Порог watchdog должен быть заметно выше нормы, иначе будет резать здоровые скрапы.
+_BROWSER_HARD_TIMEOUT = float(os.environ.get("INVESTING_BROWSER_TIMEOUT", "420"))
+_GET_RATE_TIMEOUT = float(os.environ.get("INVESTING_GET_RATE_TIMEOUT", "900"))
+
 _POPUP_SELECTORS = [
     "#onetrust-accept-btn-handler",
     ".popupCloseIcon",
@@ -42,15 +52,29 @@ def _sys_stats() -> str:
 
 def _kill_orphans() -> None:
     try:
-        me = psutil.Process(os.getpid())
+        me_pid = os.getpid()
+        seen: set[int] = set()
         targets = []
-        for child in me.children(recursive=True):
+
+        def _consider(proc) -> None:
             try:
-                name = child.name().lower()
-                if "chrome" in name or "driver" in name:
-                    targets.append(child)
+                if proc.pid in (me_pid, 1) or proc.pid in seen:
+                    return
+                name = proc.name().lower()
+                if "chrome" in name or "chromium" in name or "driver" in name:
+                    seen.add(proc.pid)
+                    targets.append(proc)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
+        for child in psutil.Process(me_pid).children(recursive=True):
+            _consider(child)
+        # UC/CDP-режим часто отвязывает Chrome от родителя (reparent к pid 1),
+        # тогда children() его не видит — добираем сканом всех процессов.
+        # Контейнер выделенный, Chrome в нём только наш, так что это безопасно.
+        for proc in psutil.process_iter(["name"]):
+            _consider(proc)
+
         if not targets:
             return
         for p in targets:
@@ -67,6 +91,41 @@ def _kill_orphans() -> None:
         logger.info("InvestingCom: cleaned %d chrome/driver process(es)", len(targets))
     except Exception:
         logger.exception("InvestingCom: kill_orphans failed")
+
+
+class _KillWatchdog:
+    """Убивает chrome/driver, если операция в браузере идёт дольше `timeout` секунд.
+
+    Зависший Selenium-вызов иначе навсегда занимает единственный поток пула
+    и threading.Lock. Убийство chrome заставляет вызов упасть с исключением,
+    поток раскручивается до finally и освобождается — система лечит себя сама.
+    """
+
+    def __init__(self, timeout: float, label: str = ""):
+        self._timeout = timeout
+        self._label = label
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.fired = False
+
+    def _run(self) -> None:
+        if not self._done.wait(self._timeout):
+            self.fired = True
+            logger.warning(
+                "InvestingCom: hard timeout %.0fs exceeded%s, killing chrome to recover [%s]",
+                self._timeout,
+                f" ({self._label})" if self._label else "",
+                _sys_stats(),
+            )
+            _kill_orphans()
+
+    def __enter__(self) -> "_KillWatchdog":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._done.set()
+        self._thread.join(timeout=5)
 
 
 class InvestingComProvider(RateProvider):
@@ -102,7 +161,7 @@ class InvestingComProvider(RateProvider):
         t0 = time.monotonic()
         logger.info("InvestingCom: starting browser [%s]", _sys_stats())
         try:
-            with SB(**self._sb_kwargs()) as sb:
+            with _KillWatchdog(_BROWSER_HARD_TIMEOUT, "fetch"), SB(**self._sb_kwargs()) as sb:
                 logger.info(
                     "InvestingCom: browser started in %.1fs [%s]",
                     time.monotonic() - t0,
@@ -151,4 +210,17 @@ class InvestingComProvider(RateProvider):
 
     async def get_rate(self) -> Decimal:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_executor, self._fetch_sync)
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(_executor, self._fetch_sync),
+                timeout=_GET_RATE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # Поток пула ещё занят зависшим вызовом — форсим kill, чтобы watchdog
+            # не ждал, и пробрасываем ошибку (FallbackProvider уйдёт на TwelveData).
+            logger.error(
+                "InvestingCom: get_rate exceeded %.0fs, aborting and killing chrome",
+                _GET_RATE_TIMEOUT,
+            )
+            _kill_orphans()
+            raise

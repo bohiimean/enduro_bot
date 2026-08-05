@@ -15,7 +15,7 @@ _CACHE_KEY_USDT = "usdt_rub"
 _CACHE_KEY_USD = "usd_rub"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
-_FACTOR = Decimal("1") / Decimal("6.7")
+_FACTOR = Decimal("1") / Decimal("6.67")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _LOADING_FRAMES = [
