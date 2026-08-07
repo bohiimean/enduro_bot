@@ -8,13 +8,13 @@
     X-API-Timestamp: unix-время в секундах (живёт 5 минут)
 где message = "{timestamp}{METHOD}{path}{body}".
 
-OPEN QUESTIONS (проверить на реальных ключах — в доках не однозначно):
-- Что входит в {path} для GET с query-параметрами: только путь или путь + "?...".
-  Сейчас подписываем полный path вместе с query (см. _signed_path). Если alfabit
-  вернёт INVALID_SIGNATURE на converter-курс — попробовать подпись без query.
-- Как подписывается multipart-загрузка документов (тело не JSON). Сейчас для
-  multipart подписываем с пустым body — тоже под вопросом.
-- payer_ip: у бота нет реального IP плательщика (Telegram его не отдаёт).
+Проверено на боевых ключах (06.08.2026):
+- GET с query подписывается одинаково успешно и с query, и без него — сервер
+  проверяет подпись без учёта query-строки. Оставили вариант с query.
+- multipart подписывается с пустым body: запрос без файла доходит до валидации
+  (422 "field required"), а не отбивается по INVALID_SIGNATURE.
+- payer_ip: Telegram не отдаёт IP пользователя; поддержка alfabit ответила —
+  слать IP сервера бота (см. services/public_ip.py).
 """
 from __future__ import annotations
 
@@ -95,11 +95,18 @@ class AlfabitClient:
 
     @staticmethod
     def _unwrap(payload: Any, status: int) -> Any:
+        # Часть ошибок (403 PERMISSION_DENIED и т.п.) приходит завёрнутой в
+        # FastAPI-конверт {"detail": {success/error/ts}} — разворачиваем, иначе
+        # код и текст ошибки терялись бы внутри строки HTTP_ERROR.
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), dict):
+            payload = payload["detail"]
         if isinstance(payload, dict) and payload.get("success") is False:
             err = payload.get("error") or {}
             raise AlfabitError(err.get("code", "UNKNOWN"), err.get("message", ""), status)
         if status >= 400:
-            raise AlfabitError("HTTP_ERROR", f"status {status}", status)
+            # FastAPI-ошибки приходят без конверта success/error: {"detail": ...}
+            detail = payload.get("detail") if isinstance(payload, dict) else None
+            raise AlfabitError("HTTP_ERROR", str(detail) if detail else f"status {status}", status)
         if isinstance(payload, dict) and "data" in payload:
             return payload["data"]
         return payload
@@ -126,6 +133,7 @@ class AlfabitClient:
         payer_phone: str,
         payer_ip: str,
         external_payment_id: str,
+        description: str | None = None,
         payer_user_agent: str | None = None,
         payer_device_id: str | None = None,
         channel: str | None = None,
@@ -142,6 +150,8 @@ class AlfabitClient:
             "payer_ip": payer_ip,
             "external_payment_id": external_payment_id,
         }
+        if description:
+            body["description"] = description
         if payer_user_agent:
             body["payer_user_agent"] = payer_user_agent
         if payer_device_id:
@@ -159,18 +169,30 @@ class AlfabitClient:
         return await self._request("GET", f"/v1/integration/checkout/payers/{phone}")
 
     async def upload_payer_document(
-        self, phone: str, doc_type: str, file_bytes: bytes, filename: str
+        self,
+        phone: str,
+        doc_type: str,
+        file_bytes: bytes,
+        filename: str,
+        *,
+        payer_ip: str | None = None,
+        content_type: str = "image/jpeg",
     ) -> dict[str, Any]:
         """POST /api/v1/integration/checkout/payers/{phone}/documents (multipart).
 
-        ВНИМАНИЕ: подпись multipart-запроса не подтверждена (см. OPEN QUESTIONS).
-        Подписываем с пустым body — при INVALID_SIGNATURE пересмотреть.
+        doc_type: passport_main | passport_registration | selfie.
+        По умолчанию профиль приёма требует passport_main + passport_registration.
+        Ответ отдаётся сразу с processing=true — финальный статус забирать
+        опросом get_payer(phone). Повторная загрузка того же doc_type безопасна.
+        Подпись — с пустым body (проверено, см. модульный docstring).
         """
         path = _API_PREFIX + f"/v1/integration/checkout/payers/{phone}/documents"
         headers = self._sign("POST", path, "")
         form = aiohttp.FormData()
         form.add_field("doc_type", doc_type)
-        form.add_field("file", file_bytes, filename=filename, content_type="application/octet-stream")
+        if payer_ip:
+            form.add_field("payer_ip", payer_ip)
+        form.add_field("file", file_bytes, filename=filename, content_type=content_type)
 
         url = self._base_url + path
         async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:

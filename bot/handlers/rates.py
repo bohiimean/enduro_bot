@@ -4,10 +4,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from aiogram import F, Router
-from aiogram.types import LinkPreviewOptions, Message
+from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 
+from handlers.payment import payment_entry_keyboard
 from services.rate_cache import RateCache
 from services.usd_markup import MOSCOW_TZ, get_usd_rate_info
+from services.yuan import FACTOR, yuan_price
 
 router = Router()
 
@@ -16,7 +18,6 @@ _CACHE_KEY_USD = "usd_rub"
 _CACHE_KEY_ALFABIT = "usdt_rub_alfabit"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
-_FACTOR = Decimal("1") / Decimal("6.67")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _LOADING_FRAMES = [
@@ -42,12 +43,8 @@ def _fmt(rate: Decimal) -> str:
     return f"{rate:.2f}"
 
 
-def _yuan_result(rate: Decimal) -> Decimal:
-    return (_FACTOR * rate).quantize(Decimal("0.01"))
-
-
 def _usd_result(base: Decimal, markup: Decimal) -> Decimal:
-    return (_FACTOR * (base + markup)).quantize(Decimal("0.01"))
+    return (FACTOR * (base + markup)).quantize(Decimal("0.01"))
 
 
 @router.message(F.text == "💱 Купить Юань")
@@ -77,6 +74,7 @@ async def cmd_rates(
         await loading.edit_text("⚠️ Курс пока не загружен, попробуйте через минуту.")
         return
 
+    keyboard: InlineKeyboardMarkup | None = None
     now = datetime.now(tz=timezone.utc)
     moscow = now.astimezone(MOSCOW_TZ)
     usd_info = get_usd_rate_info(now)
@@ -90,7 +88,7 @@ async def cmd_rates(
         f"💱 <b><u>Курс на {date_str} ({day}, {time_str})</u></b>",
         "",
         "<b>QR-оплата (Юань/Руб):</b>",
-        f"→ {_fmt(_yuan_result(usdt_entry.rate))} ₽",
+        f"→ {_fmt(yuan_price(usdt_entry.rate))} ₽",
         "",
     ]
 
@@ -98,9 +96,10 @@ async def cmd_rates(
         lines += [
             "<b>QR + KYC (верификация по фото паспорта)</b>",
             "(Юань/Руб):",
-            f"→ {_fmt(_yuan_result(alfabit_entry.rate))} ₽",
+            f"→ {_fmt(yuan_price(alfabit_entry.rate))} ₽",
             "",
         ]
+        keyboard = payment_entry_keyboard()
 
     lines += [
         "<b>Наличные в Москве</b>",
@@ -140,4 +139,5 @@ async def cmd_rates(
         "\n".join(lines),
         parse_mode="HTML",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
+        reply_markup=keyboard,
     )

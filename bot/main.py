@@ -6,7 +6,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import load_config
-from handlers import start, rates, orders, catalog
+from handlers import start, rates, orders, catalog, payment
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.alfabit.client import AlfabitClient
@@ -17,6 +17,7 @@ from services.rate_providers.fallback import FallbackProvider
 from services.rate_providers.investing import InvestingComProvider
 from services.rate_providers.rapira import RapiraProvider
 from services.rate_providers.twelvedata import TwelveDataProvider
+from services.public_ip import detect_public_ip
 from services.sheets import SheetsCache
 
 logging.basicConfig(
@@ -46,6 +47,7 @@ async def main() -> None:
     # Alfabit «обменник» USDT/RUB — источник для строки QR+KYC. Подключается
     # только если заданы ключи; иначе строка QR+KYC просто не показывается.
     alfabit_client: AlfabitClient | None = None
+    alfabit_payer_ip: str | None = None
     if config.alfabit_api_key and config.alfabit_secret_key:
         alfabit_client = AlfabitClient(
             api_key=config.alfabit_api_key,
@@ -61,6 +63,13 @@ async def main() -> None:
             ),
         )
         logger.info("Alfabit provider registered (usdt_rub_alfabit)")
+        # payer_ip для checkout: Telegram не отдаёт IP пользователя, alfabit
+        # разрешил слать IP сервера бота. Из .env или автоопределением.
+        alfabit_payer_ip = config.alfabit_payer_ip or await detect_public_ip()
+        if alfabit_payer_ip:
+            logger.info("Alfabit payer_ip: %s", alfabit_payer_ip)
+        else:
+            logger.warning("Alfabit payer_ip неизвестен — checkout будет недоступен")
     else:
         logger.info("Alfabit keys not set — QR+KYC rate disabled")
     sheets_cache = SheetsCache(
@@ -80,10 +89,15 @@ async def main() -> None:
     dp["catalog_cache"] = catalog_cache
     dp["drive_cache"] = drive_cache
     dp["manager_tg_username"] = config.manager_tg_username
+    dp["manager_tg_chat_id"] = config.manager_tg_chat_id
     dp["alfabit_client"] = alfabit_client
+    dp["alfabit_payer_ip"] = alfabit_payer_ip
+    if config.manager_tg_chat_id is None:
+        logger.warning("MANAGER_TG_CHAT_ID не задан — уведомления об оплате только в лог")
 
     dp.include_router(start.router)
     dp.include_router(rates.router)
+    dp.include_router(payment.router)
     dp.include_router(orders.router)
     dp.include_router(catalog.router)
 
