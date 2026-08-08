@@ -87,7 +87,7 @@ async def cmd_rates(
     lines = [
         f"💱 <b><u>Курс на {date_str} ({day}, {time_str})</u></b>",
         "",
-        f"<b>Курс юаня: {DIVISOR}</b>",
+        f"<b>Курс (юань/руб): — {DIVISOR}</b>",
         "",
         "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(yuan_price(usdt_entry.rate))} ₽",
@@ -99,6 +99,9 @@ async def cmd_rates(
             "<b>QR + KYC (верификация по фото паспорта)</b>",
             "(Юань/Руб):",
             f"→ {_fmt(yuan_price(alfabit_entry.rate))} ₽",
+            "- требуется пройти верификацию по паспорту,",
+            "- не работает с Альфа-Банком и Озоном",
+            "(на больших суммах не всегда срабатывает)",
             "",
         ]
         keyboard = payment_entry_keyboard()

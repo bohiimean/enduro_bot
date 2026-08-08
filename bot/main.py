@@ -11,7 +11,7 @@ from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.alfabit.client import AlfabitClient
 from services.rate_cache import RateCache
-from services.rate_providers.alfabit import AlfabitProvider
+from services.rate_providers.alfabit import AlfabitWidgetProvider
 from services.rate_providers.base import RateProvider
 from services.rate_providers.fallback import FallbackProvider
 from services.rate_providers.investing import InvestingComProvider
@@ -44,8 +44,10 @@ async def main() -> None:
     rate_cache.register("usdt_rub", rapira_provider)
     rate_cache.register("usd_rub", usd_provider)
 
-    # Alfabit «обменник» USDT/RUB — источник для строки QR+KYC. Подключается
-    # только если заданы ключи; иначе строка QR+KYC просто не показывается.
+    # Alfabit USDT/RUB по цене витрины кабинета — источник для строки QR+KYC.
+    # Курс тянется публичными эндпоинтами, но провайдер держит и подписанный
+    # клиент как запасной путь, поэтому подключается только при наличии ключей;
+    # без них строка QR+KYC просто не показывается.
     alfabit_client: AlfabitClient | None = None
     alfabit_payer_ip: str | None = None
     if config.alfabit_api_key and config.alfabit_secret_key:
@@ -56,10 +58,11 @@ async def main() -> None:
         )
         rate_cache.register(
             "usdt_rub_alfabit",
-            AlfabitProvider(
+            AlfabitWidgetProvider(
                 alfabit_client,
                 direction=config.alfabit_rate_direction,
                 markup=config.alfabit_usdt_markup,
+                base_url=config.alfabit_base_url,
             ),
         )
         logger.info("Alfabit provider registered (usdt_rub_alfabit)")
