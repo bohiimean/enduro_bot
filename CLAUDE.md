@@ -303,18 +303,19 @@ services:
 **Закрытые вопросы (06.08.2026, проверено на боевых ключах `pk_live_`/`sk_live_`):**
 - `payer_ip` — поддержка alfabit ответила: слать **IP сервера, на котором работает бот**. Реализовано: `ALFABIT_PAYER_IP` из `.env`, иначе автоопределение при старте (`services/public_ip.py` → api.ipify.org / ifconfig.me / icanhazip.com). Без IP checkout не включается, строка курса работает как раньше.
 - Query в подписи GET — сервер принимает обе формы (с query и без). Оставлен вариант с query.
-- Подпись multipart — с пустым body; проверено: запрос без файла доходит до валидации (422 `field required`), а не отбивается по подписи. Антифрод-поля (`payer_ip`) идут отдельными полями формы.
+- Подпись multipart — с пустым body; проверено: настоящий multipart-запрос доходит до валидации (422 `field required: file`), а не отбивается по подписи. Антифрод-поля (`payer_ip`) идут отдельными полями формы. **Осторожно при отладке:** `aiohttp.FormData` без файлового поля сериализуется в `x-www-form-urlencoded`, а не в multipart, и такой запрос отбивается с `401 INVALID_SIGNATURE`. Проба «POST без файла» поэтому вводит в заблуждение — она проверяет не тот content-type. В `upload_payer_document` файл добавляется всегда, так что боевой путь корректен.
 - Документы: `doc_type` ∈ `passport_main | passport_registration | selfie`, JPEG/PNG/PDF до 25 МБ. Профиль по умолчанию требует `passport_main` + `passport_registration`. Ответ приходит с `processing=true`, финальный статус — опросом `GET /payers/{phone}` (`processing:false` + `kyc_status`). Повторная загрузка того же `doc_type` идемпотентна.
 - `expected_payer_name` из `GET /payers/{phone}` — обязательно показывать плательщику: банк сверяет реального отправителя с паспортом.
 - Доступный канал приёма (`GET /checkout/channels`): `RUB_sbp_232` — «Приём мерчанта: QR+KYC white-label виджет».
 
 **Наценка QR+KYC:** цена юаня = `курс alfabit / 6.67 × 1.007` (+0.7%, решено клиентом 06.08.2026). Задаётся `ALFABIT_USDT_MARKUP`; дефолт в `config.py` тоже 1.007, чтобы наценка не пропала, если переменную забудут в `.env` на сервере. Наценка применяется и к строке курса, и к сумме платежа — они считаются из одного кешированного значения.
 
-**Блокер (06.08.2026): у боевого ключа `pk_live_*` нет прав на запись.** Все POST-эндпоинты checkout отвечают `403 PERMISSION_DENIED`, `required_permission: can_invoices_create` («Invoices Create»):
-- `POST /checkout/payers/{phone}/documents` — загрузка паспорта,
-- `POST /checkout/payments` — создание платежа.
+**Блокер прав ключа снят (08.08.2026).** Раньше все POST-эндпоинты checkout отвечали `403 PERMISSION_DENIED` (`required_permission: can_invoices_create`), из-за чего флоу останавливался на загрузке документов. После выдачи права проверено на боевых ключах прямо в контейнере:
+- `POST /checkout/payments` с телом `{}` → `422 Field required` (amount, external_payment_id) — подпись принята, право есть;
+- `POST /checkout/payers/{phone}/documents` настоящим multipart без файла → `422 Field required: file` — то же самое;
+- чтение работает как и работало (`GET /converter/fiat/rate`, `/checkout/channels`, `/checkout/payers/{phone}` → 200).
 
-Чтение работает тем же ключом (`GET /converter/fiat/rate`, `GET /checkout/channels`, `GET /checkout/payers/{phone}` → 200). То есть подпись, `payer_ip` и формат запросов в порядке — упирается только в права ключа. Чинится в кабинете alfabit (включить право «Invoices Create» ключу) или через поддержку. До этого флоу оплаты доходит до загрузки документов и останавливается; строка курса работает как раньше.
+То есть 403 больше нигде не возникает и платёжный флоу проходим целиком.
 
 **Закрыто (08.08.2026): `direction=buy`.** Конвертер котирует симметрично вокруг стакана Alfabit: при книге bid 83.00 / ask 83.45 он отдавал `sell` 82.40 и `buy` 84.13. Направление читается с позиции клиента: `sell` — вы продаёте USDT, `buy` — покупаете. Рубли от плательщика мы конвертируем в USDT, то есть покупаем его, значит наша сторона — `buy`. На `sell` курс был занижен примерно на 2% — больше самой наценки +0.7%. Дефолт в `config.py` переведён на `buy`; переменной `ALFABIT_RATE_DIRECTION` в `.env` нет, работает дефолт.
 
