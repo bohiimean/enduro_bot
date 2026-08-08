@@ -12,14 +12,15 @@ class AlfabitProvider(RateProvider):
     """USDT/RUB по «обменнику» Alfabit (converter/fiat/rate).
 
     Курс уже включает спред Alfabit. markup — дополнительная наценка сверху,
-    по умолчанию +0.7% (ALFABIT_USDT_MARKUP). direction — buy/sell (см. config).
-    Цена юаня считается из этого курса делением на 6.67 (services/yuan.py).
+    по умолчанию +0.7% (ALFABIT_USDT_MARKUP). direction — buy: USDT покупаем мы
+    (см. config). Цена юаня считается из этого курса делением на 6.67
+    (services/yuan.py).
     """
 
     def __init__(
         self,
         client: AlfabitClient,
-        direction: str = "sell",
+        direction: str = "buy",
         markup: Decimal = Decimal("1.007"),
     ):
         self._client = client

@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -32,6 +33,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from handlers.start import BTN_KYC_STATUS, MENU_BUTTONS, kyc_menu_keyboard, main_keyboard
 from services.alfabit.client import AlfabitClient, AlfabitError
 from services.rate_cache import RateCache
 from services.yuan import yuan_price
@@ -61,20 +63,29 @@ _FAILED_STATUSES = {"expired", "failed", "canceled", "cancelled", "rejected"}
 # бессилен — повторять попытку бессмысленно, чинится в кабинете alfabit.
 _ACCESS_ERROR_CODES = {"PERMISSION_DENIED", "UNAUTHORIZED", "FORBIDDEN", "INVALID_SIGNATURE"}
 
-_MENU_BUTTONS = {"💱 Купить Юань", "📦 Статус заказа", "🛍 Байки в наличии в Москве"}
 _CANCEL = "❌ Отмена"
 
 _cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=_CANCEL)]],
     resize_keyboard=True,
 )
-_phone_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)],
-        [KeyboardButton(text=_CANCEL)],
-    ],
-    resize_keyboard=True,
-)
+
+
+def _phone_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура ввода номера. Номер спрашиваем каждый раз заново — ничего
+    о пользователе между заказами не храним.
+
+    Совсем убрать поле ввода Bot API не позволяет — reply-клавиатура всегда
+    рисуется над ним. Placeholder хотя бы подсказывает, что ждём кнопку.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)],
+            [KeyboardButton(text=_CANCEL)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Нажмите кнопку ниже",
+    )
 
 
 class PayStates(StatesGroup):
@@ -126,18 +137,108 @@ def _to_e164(raw: str) -> str | None:
 
 
 async def _back_to_menu(message: Message, state: FSMContext, text: str) -> None:
-    from handlers.start import main_keyboard
-
     await state.clear()
     await message.answer(text, reply_markup=main_keyboard)
 
 
+async def _park_until_kyc(state: FSMContext) -> None:
+    """Документы на проверке: выходим из шага, чтобы пользователь свободно
+    ходил по боту, но телефон в данных оставляем — по нему кнопка «Статус
+    верификации» узнаёт, чью заявку проверять. Хранилище FSM — in-memory,
+    так что связка живёт до перезапуска процесса; после него кнопка честно
+    предложит начать оплату заново."""
+    await state.set_state(None)
+
+
 def _is_exit(text: str) -> bool:
-    return text == _CANCEL or text in _MENU_BUTTONS
+    return text == _CANCEL or text in MENU_BUTTONS
 
 
 def _is_access_error(exc: AlfabitError) -> bool:
     return exc.code in _ACCESS_ERROR_CODES or exc.status in (401, 403)
+
+
+# ---- Статус верификации (кнопка в меню) -----------------------------------
+
+# Последнее сообщение о статусе на пользователя: следующая проверка удаляет
+# предыдущее, чтобы в чате не копилась лента одинаковых «проверка ещё идёт».
+_status_messages: dict[int, int] = {}
+
+
+async def _clear_status(message: Message, user_id: int) -> None:
+    old = _status_messages.pop(user_id, None)
+    if old is None:
+        return
+    try:
+        await message.bot.delete_message(message.chat.id, old)
+    except TelegramBadRequest:
+        # Сообщение уже удалено пользователем или слишком старое — не мешает.
+        pass
+
+
+async def _replace_status(
+    message: Message,
+    user_id: int,
+    text: str,
+    reply_markup: ReplyKeyboardMarkup | None = None,
+) -> None:
+    await _clear_status(message, user_id)
+    sent = await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    _status_messages[user_id] = sent.message_id
+
+
+async def _pending_kyc_notice(message: Message, user_id: int) -> None:
+    """Документы ушли на проверку — дальше пользователь ждёт в меню."""
+    await _replace_status(
+        message,
+        user_id,
+        "⏳ Документы ушли на дополнительную проверку — это может занять время.\n\n"
+        f"Нажмите «{BTN_KYC_STATUS}» в меню, чтобы узнать результат.",
+        kyc_menu_keyboard,
+    )
+
+
+@router.message(F.text == BTN_KYC_STATUS)
+async def kyc_status(
+    message: Message,
+    state: FSMContext,
+    alfabit_client: AlfabitClient | None,
+) -> None:
+    """Зарегистрирован раньше FSM-хендлеров: кнопка живёт в меню и должна
+    работать, в каком бы сценарии пользователь сейчас ни находился."""
+    user_id = message.from_user.id
+    phone = (await state.get_data()).get("phone")
+    # Из текущего шага выходим, но данные не трогаем: телефон нужен этой же
+    # кнопке при следующем нажатии.
+    await state.set_state(None)
+
+    if phone is None or alfabit_client is None:
+        await state.clear()
+        await _replace_status(
+            message,
+            user_id,
+            "Не нашли заявку на верификацию — начните оплату заново.",
+            main_keyboard,
+        )
+        return
+
+    try:
+        payer = await alfabit_client.get_payer(phone)
+    except AlfabitError as exc:
+        logger.warning("alfabit get_payer status failed: %s", exc)
+        await _replace_status(
+            message,
+            user_id,
+            "⚠️ Сервис проверки не отвечает. Попробуйте позже.",
+            kyc_menu_keyboard,
+        )
+        return
+
+    if payer.get("processing") or payer.get("kyc_status") == "pending":
+        await _replace_status(message, user_id, "⏳ Проверка ещё идёт.", kyc_menu_keyboard)
+        return
+
+    await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
 
 
 # ---- Шаг 1: телефон -------------------------------------------------------
@@ -166,7 +267,7 @@ async def start_payment(
         "повторной загрузки документов.\n\n"
         "Отправьте номер телефона, с которого будете платить.",
         parse_mode="HTML",
-        reply_markup=_phone_keyboard,
+        reply_markup=_phone_keyboard(),
     )
 
 
@@ -191,8 +292,6 @@ async def handle_phone(
         await _back_to_menu(message, state, "⚠️ Оплата сейчас недоступна.")
         return
 
-    await state.update_data(phone=phone)
-
     try:
         payer = await alfabit_client.get_payer(phone)
     except AlfabitError as exc:
@@ -200,18 +299,22 @@ async def handle_phone(
         await _back_to_menu(message, state, "⚠️ Сервис оплаты не отвечает. Попробуйте позже.")
         return
 
-    await _route_by_kyc(message, state, payer)
+    await _route_by_kyc(message, state, payer, user_id=message.from_user.id, phone=phone)
 
 
-async def _route_by_kyc(message: Message, state: FSMContext, payer: dict) -> None:
+async def _route_by_kyc(
+    message: Message, state: FSMContext, payer: dict, *, user_id: int, phone: str
+) -> None:
     """Развилка по статусу верификации плательщика."""
+    await state.update_data(phone=phone)
     status = payer.get("kyc_status")
 
     if status == "approved":
-        await _ask_amount(message, state, payer.get("expected_payer_name"))
+        await _ask_amount(message, state, payer.get("expected_payer_name"), user_id)
         return
 
     if status == "rejected":
+        await _clear_status(message, user_id)
         await _back_to_menu(
             message,
             state,
@@ -220,16 +323,13 @@ async def _route_by_kyc(message: Message, state: FSMContext, payer: dict) -> Non
         return
 
     if status == "pending":
-        await state.set_state(PayStates.passport_main)
-        await message.answer(
-            "⏳ Документы по этому номеру уже на проверке.\n"
-            "Обычно это занимает пару минут. Нажмите кнопку, чтобы проверить статус.",
-            reply_markup=_recheck_keyboard(),
-        )
+        await _park_until_kyc(state)
+        await _pending_kyc_notice(message, user_id)
         return
 
     # not_started — просим документы
     await state.set_state(PayStates.passport_main)
+    await _clear_status(message, user_id)
     await message.answer(
         "Для оплаты нужна верификация: <b>главная страница паспорта</b> и "
         "<b>страница с пропиской</b>.\n\n"
@@ -238,15 +338,6 @@ async def _route_by_kyc(message: Message, state: FSMContext, payer: dict) -> Non
         "Пришлите фото <b>главной страницы паспорта</b>.",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard,
-    )
-
-
-def _recheck_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(
-            text="🔄 Проверить статус проверки",
-            callback_data="pay:kyc",
-        )]]
     )
 
 
@@ -364,30 +455,22 @@ async def handle_passport_registration(
     if result is None:
         return
 
+    phone = (await state.get_data())["phone"]
+    user_id = message.from_user.id
     status_msg = await message.answer("⏳ Проверяем документы…")
     assert alfabit_client is not None
-    payer = await _poll_kyc(alfabit_client, (await state.get_data())["phone"])
+    payer = await _poll_kyc(alfabit_client, phone)
 
+    await status_msg.delete()
     if payer is None:
-        await status_msg.edit_text("⚠️ Сервис проверки не отвечает. Попробуйте позже.")
+        await message.answer("⚠️ Сервис проверки не отвечает. Попробуйте позже.")
         return
-    if payer.get("kyc_status") == "approved":
-        await status_msg.delete()
-        await _ask_amount(message, state, payer.get("expected_payer_name"))
-        return
-    if payer.get("kyc_status") == "rejected":
-        await status_msg.delete()
-        await _back_to_menu(
-            message,
-            state,
-            "❌ Верификация не пройдена. Свяжитесь с менеджером — оплату оформим вручную.",
-        )
+    if payer.get("kyc_status") in ("approved", "rejected"):
+        await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
         return
 
-    await status_msg.edit_text(
-        "⏳ Документы ушли на дополнительную проверку — это может занять время.",
-        reply_markup=_recheck_keyboard(),
-    )
+    await _park_until_kyc(state)
+    await _pending_kyc_notice(message, user_id)
 
 
 async def _poll_kyc(client: AlfabitClient, phone: str) -> dict | None:
@@ -407,44 +490,29 @@ async def _poll_kyc(client: AlfabitClient, phone: str) -> dict | None:
 
 
 @router.callback_query(F.data == "pay:kyc")
-async def recheck_kyc(
-    callback: CallbackQuery,
-    state: FSMContext,
-    alfabit_client: AlfabitClient | None,
-) -> None:
+async def recheck_kyc_legacy(callback: CallbackQuery) -> None:
+    """Кнопка из старых сообщений: раньше статус проверялся инлайном, теперь —
+    кнопкой в меню. Оставлено, чтобы у тех, кто уже в проверке, кнопка не висела
+    мёртвой."""
     await callback.answer()
-    if callback.message is None or alfabit_client is None:
+    if callback.message is None:
         return
-
-    data = await state.get_data()
-    phone = data.get("phone")
-    if not phone:
-        await callback.message.answer("Сессия истекла — начните оплату заново.")
-        await state.clear()
-        return
-
-    try:
-        payer = await alfabit_client.get_payer(phone)
-    except AlfabitError as exc:
-        logger.warning("alfabit get_payer recheck failed: %s", exc)
-        await callback.message.answer("⚠️ Сервис проверки не отвечает. Попробуйте позже.")
-        return
-
-    if payer.get("processing") or payer.get("kyc_status") == "pending":
-        await callback.message.answer(
-            "⏳ Проверка ещё идёт.", reply_markup=_recheck_keyboard()
-        )
-        return
-
-    await _route_by_kyc(callback.message, state, payer)
+    await callback.message.answer(
+        f"Проверить статус можно кнопкой «{BTN_KYC_STATUS}» в меню.",
+        reply_markup=kyc_menu_keyboard,
+    )
 
 
 # ---- Шаг 3: сумма и платёж ------------------------------------------------
 
 
-async def _ask_amount(message: Message, state: FSMContext, payer_name: str | None) -> None:
+async def _ask_amount(
+    message: Message, state: FSMContext, payer_name: str | None, user_id: int
+) -> None:
     await state.update_data(payer_name=payer_name)
     await state.set_state(PayStates.amount)
+    # Убираем «проверка ещё идёт» — её место занимает сообщение об успехе.
+    await _clear_status(message, user_id)
 
     lines = ["✅ <b>Верификация пройдена.</b>"]
     if payer_name:
@@ -520,7 +588,13 @@ async def handle_amount(
 
     if payment.get("status") == "kyc_required":
         await creating.delete()
-        await _route_by_kyc(message, state, {"kyc_status": payment.get("payer_status", "not_started")})
+        await _route_by_kyc(
+            message,
+            state,
+            {"kyc_status": payment.get("payer_status", "not_started")},
+            user_id=message.from_user.id,
+            phone=phone,
+        )
         return
 
     uid = payment.get("payment_uid")
@@ -591,8 +665,6 @@ async def _send_qr(
     price: Decimal,
     payer_name: str | None,
 ) -> None:
-    from handlers.start import main_keyboard
-
     qr_url = payment.get("qr_url")
     qr_payload = payment.get("qr_payload") or qr_url
 

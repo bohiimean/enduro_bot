@@ -3,6 +3,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
+from handlers.start import MENU_BUTTONS, main_keyboard
 from services.sheets import SheetsCache
 
 router = Router()
@@ -17,9 +18,6 @@ _ask_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-_MENU_BUTTONS = {"💱 Купить Юань", "📦 Статус заказа", "🛍 Байки в наличии в Москве"}
-
-
 @router.message(F.text == "📦 Статус заказа")
 async def cmd_orders(message: Message, state: FSMContext) -> None:
     await state.set_state(OrderStates.waiting_for_phone)
@@ -33,16 +31,14 @@ async def cmd_orders(message: Message, state: FSMContext) -> None:
 async def handle_phone(message: Message, state: FSMContext, sheets_cache: SheetsCache) -> None:
     text = message.text or ""
 
-    if text == "❌ Отмена" or text in _MENU_BUTTONS:
+    if text == "❌ Отмена" or text in MENU_BUTTONS:
         await state.clear()
-        from handlers.start import main_keyboard
         await message.answer("Отменено.", reply_markup=main_keyboard)
         return
 
     orders = sheets_cache.find_orders_by_phone(text)
 
     await state.clear()
-    from handlers.start import main_keyboard
 
     if not orders:
         await message.answer(

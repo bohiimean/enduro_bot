@@ -45,7 +45,10 @@ def load_config() -> Config:
     alfabit_api_key = os.environ.get("ALFABIT_API_KEY") or None
     alfabit_secret_key = os.environ.get("ALFABIT_SECRET_KEY") or None
     alfabit_base_url = os.environ.get("ALFABIT_BASE_URL", "https://alfabit.org")
-    alfabit_rate_direction = os.environ.get("ALFABIT_RATE_DIRECTION", "sell")
+    # buy: рубли от клиента мы конвертируем в USDT, то есть покупаем его —
+    # котировка нужна с той стороны, по которой платим мы. На sell курс ниже
+    # примерно на 2%, это цена продажи USDT, не наша.
+    alfabit_rate_direction = os.environ.get("ALFABIT_RATE_DIRECTION", "buy")
     # +0.7% сверх спреда alfabit — цена юаня по QR+KYC = курс/6.67 × 1.007.
     # Дефолт не 1.0 намеренно: если переменную забыть в .env на сервере,
     # наценка не должна молча пропасть.

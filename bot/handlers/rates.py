@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 from handlers.payment import payment_entry_keyboard
 from services.rate_cache import RateCache
 from services.usd_markup import MOSCOW_TZ, get_usd_rate_info
-from services.yuan import FACTOR, yuan_price
+from services.yuan import DIVISOR, FACTOR, yuan_price
 
 router = Router()
 
@@ -86,6 +86,8 @@ async def cmd_rates(
 
     lines = [
         f"💱 <b><u>Курс на {date_str} ({day}, {time_str})</u></b>",
+        "",
+        f"<b>Курс юаня: {DIVISOR}</b>",
         "",
         "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(yuan_price(usdt_entry.rate))} ₽",

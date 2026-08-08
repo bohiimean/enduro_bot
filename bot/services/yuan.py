@@ -6,7 +6,11 @@
 """
 from decimal import Decimal
 
-FACTOR = Decimal("1") / Decimal("6.67")
+# Юаней за доллар. Показывается пользователю отдельной строкой в курсе —
+# берём оттуда же, откуда считаем, чтобы цифра в сообщении не разъехалась
+# с реальным делителем.
+DIVISOR = Decimal("6.67")
+FACTOR = Decimal("1") / DIVISOR
 
 
 def yuan_price(rate: Decimal) -> Decimal:
