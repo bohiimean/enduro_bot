@@ -1,6 +1,7 @@
 # Secrets
 bot/.env
 bot/*.json
+bot/**/*.json
 
 # Python
 __pycache__/
@@ -13,7 +14,5 @@ venv/
 # macOS
 .DS_Store
 
-# Docker
+# Docker: пустой каталог, который создаёт compose, если рядом нет ключа
 bot/credentials.json/
-
-CLAUDE.md

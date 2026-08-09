@@ -231,6 +231,7 @@ def _user_message(exc: AlfabitError) -> str:
 # Последнее сообщение о статусе на пользователя: следующая проверка удаляет
 # предыдущее, чтобы в чате не копилась лента одинаковых «проверка ещё идёт».
 _status_messages: dict[int, int] = {}
+_STATUS_LIMIT = 500
 
 
 async def _clear_status(message: Message, user_id: int) -> None:
@@ -259,6 +260,8 @@ async def _replace_status(
     """
     await _clear_status(message, user_id)
     sent = await message.answer(text, parse_mode="HTML", reply_markup=markup)
+    if user_id not in _status_messages and len(_status_messages) >= _STATUS_LIMIT:
+        _status_messages.pop(next(iter(_status_messages)))
     _status_messages[user_id] = sent.message_id
 
 

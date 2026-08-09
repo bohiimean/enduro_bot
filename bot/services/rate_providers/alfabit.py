@@ -21,33 +21,6 @@ _QR_METHOD_CODE = "SBPRUB"
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
-class AlfabitProvider(RateProvider):
-    """USDT/RUB по «обменнику» Alfabit (converter/fiat/rate).
-
-    Базовый курс конвертера со спредом Alfabit, без комиссии метода оплаты.
-    В кабинете покупатель видит не его, а курс витрины — см.
-    AlfabitWidgetProvider, который и подключён в main. Этот класс остался
-    источником базы для витринного провайдера и как аварийный путь по
-    подписанному API, если публичные эндпоинты перестанут отвечать.
-    """
-
-    def __init__(
-        self,
-        client: AlfabitClient,
-        direction: str = "buy",
-        markup: Decimal = Decimal("1.006"),
-    ):
-        self._client = client
-        self._direction = direction
-        self._markup = markup
-
-    async def get_rate(self) -> Decimal:
-        rate = await self._client.converter_fiat_rate(
-            crypto="USDT", fiat="RUB", direction=self._direction
-        )
-        return rate * self._markup
-
-
 class AlfabitWidgetProvider(RateProvider):
     """USDT/RUB по цене витрины Alfabit — виджет «Купить USDT», метод оплаты QR.
 
