@@ -15,9 +15,16 @@
   (422 "field required"), а не отбивается по INVALID_SIGNATURE.
 - payer_ip: Telegram не отдаёт IP пользователя; поддержка alfabit ответила —
   слать IP сервера бота (см. services/public_ip.py).
+
+Наружу клиент бросает только AlfabitError — включая обрывы связи, таймауты и
+не-JSON ответы. Иначе транспортное исключение пролетало бы мимо `except
+AlfabitError` в хендлерах, а глобального error-хендлера у бота нет: сценарий
+молча умирал бы посреди загрузки паспорта. Alfabit стоит за Cloudflare и уже
+отдавал 522 с HTML-страницей вместо JSON.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -35,13 +42,22 @@ _TIMEOUT = aiohttp.ClientTimeout(total=20)
 
 
 class AlfabitError(RuntimeError):
-    """Ошибка ответа Alfabit API (success=false или HTTP != 2xx)."""
+    """Ошибка обращения к Alfabit API.
+
+    code — либо код из ответа сервиса, либо один из транспортных:
+    NETWORK (обрыв/таймаут), BAD_RESPONSE (ответ не JSON), HTTP_ERROR.
+    """
 
     def __init__(self, code: str, message: str, status: int | None = None):
         self.code = code
         self.message = message
         self.status = status
         super().__init__(f"{code}: {message}")
+
+
+# Ошибки, где виноват не запрос, а связь или сам сервис: пользователю про них
+# нужно сказать одно и то же — «попробуйте позже».
+TRANSPORT_ERROR_CODES = frozenset({"NETWORK", "BAD_RESPONSE"})
 
 
 class AlfabitClient:
@@ -81,17 +97,44 @@ class AlfabitClient:
         headers = self._sign(method, self._signed_path(path, params), body)
         headers["Content-Type"] = "application/json"
 
-        url = self._base_url + path
-        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
-            async with session.request(
-                method,
-                url,
-                params=params,
-                data=body or None,
-                headers=headers,
-            ) as resp:
-                payload = await resp.json(content_type=None)
-                return self._unwrap(payload, resp.status)
+        return await self._perform(
+            method,
+            self._base_url + path,
+            headers=headers,
+            params=params,
+            data=body or None,
+        )
+
+    async def _perform(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        params: dict[str, Any] | None = None,
+        data: Any = None,
+    ) -> Any:
+        """Единственное место, где живёт сеть: всё, что может прилететь от
+        aiohttp, превращается в AlfabitError."""
+        try:
+            async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+                async with session.request(
+                    method, url, params=params, data=data, headers=headers
+                ) as resp:
+                    try:
+                        payload = await resp.json(content_type=None)
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                        # Cloudflare и прочие прокси отдают HTML — в лог кусок
+                        # тела, иначе причину 5xx потом не восстановить.
+                        snippet = " ".join((await resp.text())[:200].split())
+                        raise AlfabitError(
+                            "BAD_RESPONSE",
+                            f"ответ не в формате JSON (HTTP {resp.status}): {snippet}",
+                            resp.status,
+                        ) from None
+                    return self._unwrap(payload, resp.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            raise AlfabitError("NETWORK", f"{type(exc).__name__}: {exc}") from exc
 
     @staticmethod
     def _unwrap(payload: Any, status: int) -> Any:
@@ -194,11 +237,7 @@ class AlfabitClient:
             form.add_field("payer_ip", payer_ip)
         form.add_field("file", file_bytes, filename=filename, content_type=content_type)
 
-        url = self._base_url + path
-        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
-            async with session.post(url, data=form, headers=headers) as resp:
-                payload = await resp.json(content_type=None)
-                return self._unwrap(payload, resp.status)
+        return await self._perform("POST", self._base_url + path, headers=headers, data=form)
 
     async def checkout_channels(self) -> Any:
         """GET /api/v1/integration/checkout/channels — доступные СБП-каналы приёма."""
