@@ -9,9 +9,7 @@ def catalog_list_keyboard(
 ) -> InlineKeyboardMarkup:
     buttons = []
     for idx, item in indexed_items:
-        название = item.get("название", "—")
-        цена = item.get("цена", "")
-        label = название
+        label = item.get("название", "—")
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"item:{idx}:{list_msg_id}")])
 
     buttons.append([InlineKeyboardButton(text="🏠 В меню", callback_data="cat:menu")])
