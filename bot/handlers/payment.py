@@ -9,6 +9,21 @@
 
 Состояние на сервере не храним (кроме подсказки для уведомления менеджера):
 payment_uid кодируется прямо в callback_data кнопки «Я оплатил».
+
+Отрезок «телефон → пройденный KYC» — самый хрупкий: половина комплекта в
+Alfabit означает заявку в вечном pending, из которой обычный сценарий не
+выпускает (ветка pending в _route_by_kyc только просит ждать). Поэтому здесь:
+- документы копятся в буфере и уходят комплектом (_send_documents), а не по
+  мере поступления: если человек пропал после первой страницы, в Alfabit не
+  осталось ничего;
+- альбом отклоняем — замок задаёт очередь, но не порядок, и пара снимков может
+  переставиться местами (см. _reject_album);
+- шаг сбора документов не сбрасывает ни одна кнопка меню (см. kyc_status);
+- приём файлов идёт под замком на пользователя, чтобы два быстрых сообщения не
+  заняли один слот;
+- на этих шагах у пользователя видна только «Отмена»;
+- любое сообщение, не подошедшее ни одному хендлеру, ловит handlers/fallback.py,
+  чтобы фото паспорта не пропадало молча.
 """
 from __future__ import annotations
 
@@ -20,7 +35,7 @@ from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -33,8 +48,14 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from handlers.start import BTN_KYC_STATUS, MENU_BUTTONS, kyc_menu_keyboard, main_keyboard
-from services.alfabit.client import AlfabitClient, AlfabitError
+from handlers.start import (
+    BTN_KYC_REDO,
+    BTN_KYC_STATUS,
+    MENU_BUTTONS,
+    kyc_menu_keyboard,
+    main_keyboard,
+)
+from services.alfabit.client import TRANSPORT_ERROR_CODES, AlfabitClient, AlfabitError
 from services.rate_cache import RateCache
 from services.yuan import yuan_price
 from utils.phone import normalize_phone
@@ -48,6 +69,10 @@ _RATE_MAX_AGE = 180
 # Загрузка документов: профиль приёма по умолчанию требует эти два.
 _DOC_MAIN = "passport_main"
 _DOC_REGISTRATION = "passport_registration"
+
+# getFile не отдаёт боту файлы больше 20 МБ (у Alfabit предел 25 МБ, но до него
+# дело не дойдёт). Проверяем по file_size из апдейта — до скачивания.
+_MAX_FILE_BYTES = 20 * 1024 * 1024
 
 # Поллинг статуса KYC после загрузки документов (processing=true).
 _KYC_POLL_ATTEMPTS = 10
@@ -65,10 +90,37 @@ _ACCESS_ERROR_CODES = {"PERMISSION_DENIED", "UNAUTHORIZED", "FORBIDDEN", "INVALI
 
 _CANCEL = "❌ Отмена"
 
+# На шагах с документами и суммой в меню не должно остаться ничего, кроме
+# «Отмена»: любая другая кнопка здесь — способ случайно выйти из сценария.
 _cancel_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=_CANCEL)]],
     resize_keyboard=True,
+    input_field_placeholder="Пришлите фото документа",
 )
+
+# Загрузка документов по одному пользователю строго по очереди. Telegram шлёт
+# альбом двумя update'ами, а aiogram обрабатывает их параллельными задачами
+# (handle_as_tasks=True), поэтому без замка оба фото попадали в шаг
+# passport_main и второе перезаписывало первое.
+_upload_locks: dict[int, asyncio.Lock] = {}
+_LOCK_LIMIT = 500
+
+
+def _user_lock(user_id: int) -> asyncio.Lock:
+    lock = _upload_locks.get(user_id)
+    if lock is None:
+        if len(_upload_locks) >= _LOCK_LIMIT:
+            for stale_id, stale in list(_upload_locks.items()):
+                if not stale.locked():
+                    del _upload_locks[stale_id]
+                    break
+        lock = asyncio.Lock()
+        _upload_locks[user_id] = lock
+    return lock
+
+
+class _FileError(Exception):
+    """Файл не удалось взять из Telegram. Текст — готовый ответ пользователю."""
 
 
 def _phone_keyboard() -> ReplyKeyboardMarkup:
@@ -93,6 +145,14 @@ class PayStates(StatesGroup):
     passport_main = State()
     passport_registration = State()
     amount = State()
+
+
+# doc_type → (ключ в данных FSM, шаг сценария, как называть страницу человеку).
+# Порядок важен: комплект уходит в Alfabit в порядке этого словаря.
+_DOC_SLOTS: dict[str, tuple[str, State, str]] = {
+    _DOC_MAIN: ("doc_main", PayStates.passport_main, "главной страницы паспорта"),
+    _DOC_REGISTRATION: ("doc_reg", PayStates.passport_registration, "страницы с пропиской"),
+}
 
 
 @dataclass
@@ -158,6 +218,14 @@ def _is_access_error(exc: AlfabitError) -> bool:
     return exc.code in _ACCESS_ERROR_CODES or exc.status in (401, 403)
 
 
+def _user_message(exc: AlfabitError) -> str:
+    """Текст ошибки для пользователя. Транспортные коды прячем: «NETWORK:
+    ServerDisconnectedError» человеку ничего не объясняет."""
+    if exc.code in TRANSPORT_ERROR_CODES:
+        return "платёжный сервис не отвечает, попробуйте через пару минут"
+    return exc.message or exc.code
+
+
 # ---- Статус верификации (кнопка в меню) -----------------------------------
 
 # Последнее сообщение о статусе на пользователя: следующая проверка удаляет
@@ -180,22 +248,106 @@ async def _replace_status(
     message: Message,
     user_id: int,
     text: str,
-    reply_markup: ReplyKeyboardMarkup | None = None,
+    markup: InlineKeyboardMarkup | None = None,
 ) -> None:
+    """Сообщение о статусе: предыдущее удаляем, новое шлём вниз чата.
+
+    Разметка только инлайновая. Reply-клавиатуру такие сообщения не носят
+    намеренно: удаление сообщения уносит с собой и меню, которое оно поставило,
+    и человек остаётся без клавиатуры вообще. Всё, что ставит меню, шлётся через
+    _menu_message и не удаляется никогда.
+    """
     await _clear_status(message, user_id)
-    sent = await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    sent = await message.answer(text, parse_mode="HTML", reply_markup=markup)
     _status_messages[user_id] = sent.message_id
 
 
+async def _menu_message(
+    message: Message, user_id: int, text: str, keyboard: ReplyKeyboardMarkup
+) -> None:
+    """Сообщение, которое (пере)ставит меню. Как статусное не регистрируется —
+    удалять его нельзя, вместе с ним исчезнет клавиатура."""
+    await _clear_status(message, user_id)
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+def _redo_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка «отправить документы заново».
+
+    Сейчас нигде не подставляется — решено не показывать её пользователю
+    (см. kyc_status). Оставлена вместе с хендлером kyc:redo: путь рабочий, и
+    если недостача после перезапуска бота окажется частой, кнопка возвращается
+    одной строкой. Заодно кнопка живёт в уже отправленных старых сообщениях.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=BTN_KYC_REDO, callback_data="kyc:redo")]]
+    )
+
+
 async def _pending_kyc_notice(message: Message, user_id: int) -> None:
-    """Документы ушли на проверку — дальше пользователь ждёт в меню."""
-    await _replace_status(
+    """Документы ушли на проверку — дальше пользователь ждёт в меню.
+
+    Это сообщение и ставит меню с кнопкой статуса, поэтому оно из неудаляемых.
+    """
+    await _menu_message(
         message,
         user_id,
         "⏳ Документы ушли на дополнительную проверку — это может занять время.\n\n"
         f"Нажмите «{BTN_KYC_STATUS}» в меню, чтобы узнать результат.",
         kyc_menu_keyboard,
     )
+
+
+@router.callback_query(F.data == "kyc:redo")
+async def redo_documents(callback: CallbackQuery, state: FSMContext) -> None:
+    """Аварийный выход из зависшего pending.
+
+    Штатно недостачу закрывает _missing_docs: бот помнит, что успел отправить,
+    и сам просит недостающую страницу. Но эта память живёт в процессе, и после
+    перезапуска бота случай «Alfabit ждёт документ, а бот думает, что ждать
+    должен человек» снова неразличим. Тогда остаётся отправить комплект заново —
+    повторная загрузка того же doc_type идемпотентна, так что это безопасно и
+    когда на самом деле идёт ручная сверка.
+    """
+    await callback.answer()
+    if callback.message is None:
+        return
+    message = callback.message
+    user_id = callback.from_user.id
+    phone = (await state.get_data()).get("phone")
+    if phone is None:
+        await state.clear()
+        await _menu_message(
+            message,
+            user_id,
+            "Не нашли заявку на верификацию — начните оплату заново.",
+            main_keyboard,
+        )
+        return
+
+    await state.set_state(PayStates.passport_main)
+    await _clear_docs(state)
+    _uploaded_docs.pop(phone, None)
+    await _clear_status(message, user_id)
+    await message.answer(
+        "Отправим документы заново. Пришлите фото <b>главной страницы паспорта</b>.",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard,
+    )
+
+
+# Что бот ждёт на каждом шаге — для ответа на кнопку меню, нажатую посреди
+# сценария.
+_STEP_HINTS = {
+    PayStates.phone.state: "Жду номер телефона, с которого будете платить.",
+    PayStates.passport_main.state: "Жду фото главной страницы паспорта.",
+    PayStates.passport_registration.state: "Жду фото страницы с пропиской.",
+    PayStates.amount.state: "Жду количество юаней.",
+}
+
+
+def _step_keyboard(current: str | None) -> ReplyKeyboardMarkup:
+    return _phone_keyboard() if current == PayStates.phone.state else _cancel_keyboard
 
 
 @router.message(F.text == BTN_KYC_STATUS)
@@ -205,16 +357,31 @@ async def kyc_status(
     alfabit_client: AlfabitClient | None,
 ) -> None:
     """Зарегистрирован раньше FSM-хендлеров: кнопка живёт в меню и должна
-    работать, в каком бы сценарии пользователь сейчас ни находился."""
+    работать, в каком бы сценарии пользователь сейчас ни находился.
+
+    Именно поэтому шаг здесь трогать нельзя. Раньше хендлер безусловно делал
+    set_state(None), и нажатие кнопки посреди загрузки документов уничтожало
+    состояние: следующее фото не подходило ни одному хендлеру и молча
+    выбрасывалось. В Alfabit оставался один документ из двух, заявка навсегда
+    зависала в pending. Проверять статус имеет смысл только когда сценарий
+    завершён (состояние None) — в остальных случаях подсказываем, чего ждём.
+    """
     user_id = message.from_user.id
+    current = await state.get_state()
+    if current is not None:
+        await message.answer(
+            "Сначала закончим оформление оплаты — проверять пока нечего.\n"
+            f"{_STEP_HINTS.get(current, '')}\n\n"
+            f"Чтобы выйти, нажмите «{_CANCEL}».",
+            reply_markup=_step_keyboard(current),
+        )
+        return
+
     phone = (await state.get_data()).get("phone")
-    # Из текущего шага выходим, но данные не трогаем: телефон нужен этой же
-    # кнопке при следующем нажатии.
-    await state.set_state(None)
 
     if phone is None or alfabit_client is None:
         await state.clear()
-        await _replace_status(
+        await _menu_message(
             message,
             user_id,
             "Не нашли заявку на верификацию — начните оплату заново.",
@@ -226,7 +393,7 @@ async def kyc_status(
         payer = await alfabit_client.get_payer(phone)
     except AlfabitError as exc:
         logger.warning("alfabit get_payer status failed: %s", exc)
-        await _replace_status(
+        await _menu_message(
             message,
             user_id,
             "⚠️ Сервис проверки не отвечает. Попробуйте позже.",
@@ -234,8 +401,18 @@ async def kyc_status(
         )
         return
 
-    if payer.get("processing") or payer.get("kyc_status") == "pending":
-        await _replace_status(message, user_id, "⏳ Проверка ещё идёт.", kyc_menu_keyboard)
+    # Идёт обработка — недостачу разбирать рано, что-то из документов сейчас
+    # как раз читают.
+    #
+    # Кнопку повтора здесь намеренно не показываем (решено 09.08.2026): штатно
+    # недостачу закрывает _missing_docs, а лишний повод переотправить документы
+    # посреди сверки скорее путает. Сам путь жив — _redo_keyboard и хендлер
+    # kyc:redo на месте, вернуть кнопку значит передать разметку сюда.
+    if payer.get("processing"):
+        await _replace_status(message, user_id, "⏳ Проверка ещё идёт.")
+        return
+    if payer.get("kyc_status") == "pending" and not _missing_docs(phone):
+        await _replace_status(message, user_id, "⏳ Проверка ещё идёт.")
         return
 
     await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
@@ -310,10 +487,12 @@ async def _route_by_kyc(
     status = payer.get("kyc_status")
 
     if status == "approved":
+        _uploaded_docs.pop(phone, None)
         await _ask_amount(message, state, payer.get("expected_payer_name"), user_id)
         return
 
     if status == "rejected":
+        _uploaded_docs.pop(phone, None)
         await _clear_status(message, user_id)
         await _back_to_menu(
             message,
@@ -323,12 +502,28 @@ async def _route_by_kyc(
         return
 
     if status == "pending":
+        # Alfabit держит в pending и когда идёт сверка, и когда ждёт документ.
+        # Различить это может только наша память о том, что мы отправляли.
+        missing = _missing_docs(phone)
+        if missing:
+            doc_type = missing[0]
+            await _clear_status(message, user_id)
+            await _ask_again(
+                message,
+                state,
+                doc_type,
+                "Верификация не завершена: до сервиса дошла только часть документов.",
+            )
+            return
         await _park_until_kyc(state)
         await _pending_kyc_notice(message, user_id)
         return
 
-    # not_started — просим документы
+    # not_started — просим документы. Если про номер что-то помнилось, сведения
+    # устарели: у сервиса ничего нет, верить надо ему.
+    _uploaded_docs.pop(phone, None)
     await state.set_state(PayStates.passport_main)
+    await _clear_docs(state)
     await _clear_status(message, user_id)
     await message.answer(
         "Для оплаты нужна верификация: <b>главная страница паспорта</b> и "
@@ -344,132 +539,305 @@ async def _route_by_kyc(
 # ---- Шаг 2: документы -----------------------------------------------------
 
 
-async def _extract_file(message: Message, bot: Bot) -> tuple[bytes, str, str] | None:
-    """(байты, имя файла, mime) из фото или документа. None — если не то прислали."""
+def _describe_file(message: Message) -> dict[str, str]:
+    """Ссылка на присланный файл: file_id, имя, mime. Ничего не скачивает.
+
+    Пока комплект не собран, байты не нужны — файл и так лежит у Telegram, нам
+    достаточно ссылки. Размер проверяем здесь же, по file_size из апдейта:
+    раньше про слишком большой файл узнавали только когда падало скачивание.
+    """
     if message.photo:
-        file_id = message.photo[-1].file_id
-        filename, mime = "passport.jpg", "image/jpeg"
+        photo = message.photo[-1]
+        file_id, filename, mime, size = photo.file_id, "passport.jpg", "image/jpeg", photo.file_size
     elif message.document and (message.document.mime_type or "").startswith(("image/", "application/pdf")):
-        file_id = message.document.file_id
-        filename = message.document.file_name or "passport"
-        mime = message.document.mime_type or "application/octet-stream"
+        document = message.document
+        file_id = document.file_id
+        filename = document.file_name or "passport"
+        mime = document.mime_type or "application/octet-stream"
+        size = document.file_size
     else:
-        return None
+        raise _FileError(
+            "Нужно фото документа — пришлите изображение или PDF.\n"
+            "Лучше отправлять файлом, без сжатия: так текст остаётся читаемым."
+        )
 
+    if size and size > _MAX_FILE_BYTES:
+        raise _FileError(
+            "Файл больше 20 МБ — Telegram не отдаёт такие ботам.\n"
+            "Сфотографируйте страницу отдельно или уменьшите размер."
+        )
+    return {"file_id": file_id, "filename": filename, "mime": mime}
+
+
+async def _download_file(bot: Bot, ref: dict[str, str]) -> bytes:
     buffer = BytesIO()
-    await bot.download(file_id, destination=buffer)
-    return buffer.getvalue(), filename, mime
-
-
-async def _upload_document(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-    alfabit_client: AlfabitClient | None,
-    alfabit_payer_ip: str | None,
-    doc_type: str,
-) -> dict | None:
-    """Скачивает фото из Telegram и отдаёт его в alfabit. None — если не вышло."""
-    if alfabit_client is None or not alfabit_payer_ip:
-        await _back_to_menu(message, state, "⚠️ Оплата сейчас недоступна.")
-        return None
-
-    extracted = await _extract_file(message, bot)
-    if extracted is None:
-        await message.answer("Нужно фото документа — пришлите изображение или PDF.")
-        return None
-
-    file_bytes, filename, mime = extracted
-    data = await state.get_data()
-    phone = data["phone"]
-
     try:
-        return await alfabit_client.upload_payer_document(
-            phone,
-            doc_type,
-            file_bytes,
-            filename,
-            payer_ip=alfabit_payer_ip,
-            content_type=mime,
-        )
-    except AlfabitError as exc:
-        if _is_access_error(exc):
-            # Прав у ключа нет — другое фото не поможет, не гоняем человека по кругу.
-            logger.error("alfabit upload %s: доступ запрещён (%s)", doc_type, exc)
-            await _back_to_menu(
-                message,
-                state,
-                "⚠️ Сервис верификации сейчас недоступен. Напишите менеджеру — "
-                "оплату оформим вручную.",
-            )
-            return None
-        logger.warning("alfabit upload %s failed: %s", doc_type, exc)
-        await message.answer(
-            "⚠️ Сервис не принял документ. Попробуйте другое фото — "
-            "чтобы страница попадала целиком и текст был читаемым."
-        )
-        return None
+        await bot.download(ref["file_id"], destination=buffer)
+    except TelegramAPIError as exc:
+        logger.warning("не удалось скачать документ из Telegram: %s", exc)
+        raise _FileError("Не смог скачать файл из Telegram.") from exc
+    return buffer.getvalue()
 
 
-@router.message(PayStates.passport_main)
-async def handle_passport_main(
-    message: Message,
-    state: FSMContext,
-    bot: Bot,
-    alfabit_client: AlfabitClient | None,
-    alfabit_payer_ip: str | None,
-) -> None:
-    if message.text and _is_exit(message.text):
-        await _back_to_menu(message, state, "Отменено.")
+async def _clear_docs(state: FSMContext) -> None:
+    """Сброс собранного комплекта — при новом заходе на верификацию."""
+    await state.update_data(doc_main=None, doc_reg=None, uploaded=[])
+
+
+# Что из комплекта Alfabit уже принял, по номеру телефона. Своя память нужна
+# потому, что сервис этого не говорит: GET /payers/{phone} отдаёт
+# required_documents — требования профиля, а не недостачу. Проверено на живом
+# API: у approved-плательщика с обоими документами список ровно тот же, что у
+# номера, который сервис видит впервые.
+#
+# Живёт до перезапуска процесса. На диск не пишем сознательно — это снова был
+# бы телефон в файле, от чего 08.08 отказались. После рестарта недостача
+# неизвестна, и остаётся ручной путь (кнопка «отправить заново»).
+_uploaded_docs: dict[str, set[str]] = {}
+_UPLOADED_LIMIT = 500
+
+
+def _remember_upload(phone: str, doc_type: str) -> None:
+    if phone not in _uploaded_docs and len(_uploaded_docs) >= _UPLOADED_LIMIT:
+        _uploaded_docs.pop(next(iter(_uploaded_docs)))
+    _uploaded_docs.setdefault(phone, set()).add(doc_type)
+
+
+def _missing_docs(phone: str) -> list[str]:
+    """Чего не хватает Alfabit по нашим сведениям. Пустой список — либо всё
+    отправлено, либо мы про этот номер ничего не знаем."""
+    known = _uploaded_docs.get(phone)
+    if known is None:
+        return []
+    return [doc_type for doc_type in _DOC_SLOTS if doc_type not in known]
+
+
+# Альбомы отклоняем; помним последний отклонённый на пользователя, чтобы на
+# второй снимок того же альбома не отвечать второй раз.
+_rejected_albums: dict[int, str] = {}
+_ALBUM_LIMIT = 500
+
+
+async def _reject_album(message: Message, user_id: int, doc_type: str) -> None:
+    """Несколько снимков одним сообщением принять нельзя.
+
+    Замок не даёт двум фото уехать в один doc_type, но порядок он не задаёт:
+    задачи приходят к нему в порядке планировщика, а не по message_id. Если
+    пара переставится, прописка уедет как главная страница — оба файла на
+    месте, бот доволен, а разбирается человек на стороне Alfabit. Просить по
+    одному дешевле, тем более что бот и так спрашивает страницы по очереди.
+    """
+    group = message.media_group_id
+    if _rejected_albums.get(user_id) == group:
+        # Второй снимок того же альбома — молча, иначе два упрёка подряд.
         return
+    if len(_rejected_albums) >= _ALBUM_LIMIT:
+        _rejected_albums.pop(next(iter(_rejected_albums)))
+    _rejected_albums[user_id] = group
 
-    result = await _upload_document(
-        message, state, bot, alfabit_client, alfabit_payer_ip, _DOC_MAIN
-    )
-    if result is None:
-        return
-
-    await state.set_state(PayStates.passport_registration)
     await message.answer(
-        "✅ Принято.\nТеперь пришлите фото <b>страницы с пропиской</b>.",
+        "Пришлите снимки <b>по одному</b> — так я точно не перепутаю страницы "
+        "местами.\n\n"
+        f"Сейчас жду фото <b>{_DOC_SLOTS[doc_type][2]}</b>.",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard,
     )
 
 
+async def _has_registration(state: FSMContext) -> bool:
+    """Прописка уже в буфере или уже принята Alfabit.
+
+    Бывает после сбоя на первой странице: её переспросили, человек прислал —
+    и просить прописку второй раз незачем, она никуда не девалась.
+    """
+    data = await state.get_data()
+    return data.get("doc_reg") is not None or _DOC_REGISTRATION in (data.get("uploaded") or [])
+
+
+@router.message(PayStates.passport_main)
 @router.message(PayStates.passport_registration)
-async def handle_passport_registration(
+async def handle_document(
     message: Message,
     state: FSMContext,
     bot: Bot,
     alfabit_client: AlfabitClient | None,
     alfabit_payer_ip: str | None,
 ) -> None:
+    """Оба шага загрузки — один хендлер: какую страницу сейчас ждём, решается
+    ПОД замком, по актуальному состоянию.
+
+    В Alfabit отсюда ничего не уходит: файл кладётся в буфер, а отправляется
+    комплект целиком — см. _send_documents. Замок нужен, чтобы два быстрых
+    сообщения подряд не заняли один и тот же слот.
+    """
     if message.text and _is_exit(message.text):
         await _back_to_menu(message, state, "Отменено.")
         return
 
-    result = await _upload_document(
-        message, state, bot, alfabit_client, alfabit_payer_ip, _DOC_REGISTRATION
+    user_id = message.from_user.id
+    async with _user_lock(user_id):
+        current = await state.get_state()
+        if current == PayStates.passport_main.state:
+            doc_type = _DOC_MAIN
+        elif current == PayStates.passport_registration.state:
+            doc_type = _DOC_REGISTRATION
+        else:
+            # Пока ждали очереди, сценарий закончился или его отменили. Молчать
+            # тут нельзя — человек только что прислал документ.
+            await message.answer(
+                "Этот файл я <b>никуда не отправил</b> — сейчас документы не нужны.",
+                parse_mode="HTML",
+            )
+            return
+
+        if message.media_group_id is not None:
+            await _reject_album(message, user_id, doc_type)
+            return
+
+        try:
+            ref = _describe_file(message)
+        except _FileError as exc:
+            await message.answer(str(exc), reply_markup=_cancel_keyboard)
+            return
+
+        await state.update_data(**{_DOC_SLOTS[doc_type][0]: ref})
+
+        if doc_type == _DOC_MAIN and not await _has_registration(state):
+            await state.set_state(PayStates.passport_registration)
+            await message.answer(
+                "✅ Первая страница у меня.\n"
+                "Теперь пришлите фото <b>страницы с пропиской</b> — отправлю оба "
+                "документа сразу, как только комплект будет собран.",
+                parse_mode="HTML",
+                reply_markup=_cancel_keyboard,
+            )
+            return
+
+        # Комплект собран — только теперь идём в Alfabit. Отправка идёт под тем
+        # же замком: лишнее фото, присланное следом, дождётся конца и получит
+        # ответ, а не уедет третьим запросом.
+        await _send_documents(
+            message, state, bot, alfabit_client, alfabit_payer_ip, user_id
+        )
+
+
+async def _ask_again(message: Message, state: FSMContext, doc_type: str, reason: str) -> None:
+    """Переспрашиваем ровно тот документ, который не дошёл: остальной комплект
+    остаётся в буфере, повторять его целиком человеку не нужно."""
+    slot_key, step, human = _DOC_SLOTS[doc_type]
+    await state.update_data(**{slot_key: None})
+    await state.set_state(step)
+    await message.answer(
+        f"{reason}\n\nПришлите фото <b>{human}</b> ещё раз.",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard,
     )
-    if result is None:
+
+
+async def _send_documents(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    alfabit_client: AlfabitClient | None,
+    alfabit_payer_ip: str | None,
+    user_id: int,
+) -> None:
+    """Отправляет собранный комплект в Alfabit.
+
+    Эндпоинт у Alfabit поштучный, батча нет — комплект всё равно уходит двумя
+    запросами. Но окно «в сервисе половина комплекта» сжимается с человеческого
+    масштаба (пока ищут вторую страницу — а то и никогда) до промежутка между
+    двумя вызовами. И если второй упадёт, ссылки на файлы у нас на руках:
+    переспрашиваем только тот документ, который не дошёл, уже принятые
+    повторно не шлём (uploaded в данных FSM).
+    """
+    if alfabit_client is None or not alfabit_payer_ip:
+        await _back_to_menu(message, state, "⚠️ Оплата сейчас недоступна.")
         return
 
-    phone = (await state.get_data())["phone"]
-    user_id = message.from_user.id
-    status_msg = await message.answer("⏳ Проверяем документы…")
-    assert alfabit_client is not None
-    payer = await _poll_kyc(alfabit_client, phone)
+    data = await state.get_data()
+    phone: str = data["phone"]
+    uploaded: list[str] = list(data.get("uploaded") or [])
 
-    await status_msg.delete()
+    status = await message.answer("⏳ Отправляем документы…")
+
+    for doc_type, (slot_key, _step, human) in _DOC_SLOTS.items():
+        if doc_type in uploaded:
+            continue
+        ref = data.get(slot_key)
+        if ref is None:
+            await status.delete()
+            await _ask_again(message, state, doc_type, f"Не хватает фото {human}.")
+            return
+
+        try:
+            file_bytes = await _download_file(bot, ref)
+        except _FileError as exc:
+            await status.delete()
+            await _ask_again(message, state, doc_type, str(exc))
+            return
+
+        try:
+            result = await alfabit_client.upload_payer_document(
+                phone,
+                doc_type,
+                file_bytes,
+                ref["filename"],
+                payer_ip=alfabit_payer_ip,
+                content_type=ref["mime"],
+            )
+        except AlfabitError as exc:
+            await status.delete()
+            if _is_access_error(exc):
+                # Прав у ключа нет — другое фото не поможет, не гоняем по кругу.
+                logger.error("alfabit upload %s: доступ запрещён (%s)", doc_type, exc)
+                await _back_to_menu(
+                    message,
+                    state,
+                    "⚠️ Сервис верификации сейчас недоступен. Напишите менеджеру — "
+                    "оплату оформим вручную.",
+                )
+                return
+            logger.warning("alfabit upload %s failed: %s", doc_type, exc)
+            if exc.code in TRANSPORT_ERROR_CODES:
+                reason = "⚠️ Сервис верификации не отвечает — документ не отправился."
+            else:
+                reason = (
+                    "⚠️ Сервис не принял документ. Нужно фото, где страница "
+                    "попадает целиком и текст читается."
+                )
+            await _ask_again(message, state, doc_type, reason)
+            return
+
+        # Единственный след того, ЧТО именно уехало в Alfabit.
+        logger.info(
+            "KYC upload ok: user=%s doc_type=%s processing=%s",
+            user_id, doc_type, result.get("processing"),
+        )
+        uploaded.append(doc_type)
+        await state.update_data(uploaded=uploaded)
+        # Данные FSM пропадут при «Отмене», а этот след — нет: по нему бот
+        # узнает недостачу, даже если человек вернётся через час с чистого места.
+        _remember_upload(phone, doc_type)
+
+    await _park_until_kyc(state)
+    await status.edit_text("⏳ Проверяем документы…")
+    payer = await _poll_kyc(alfabit_client, phone)
+    await status.delete()
+
     if payer is None:
-        await message.answer("⚠️ Сервис проверки не отвечает. Попробуйте позже.")
+        # Документы уже в Alfabit — важно вернуть меню с кнопкой статуса,
+        # иначе человек остаётся с одной «Отменой» и без пути назад.
+        await message.answer(
+            "⚠️ Сервис проверки не отвечает, но документы отправлены.\n"
+            f"Результат посмотрите кнопкой «{BTN_KYC_STATUS}» в меню.",
+            reply_markup=kyc_menu_keyboard,
+        )
         return
     if payer.get("kyc_status") in ("approved", "rejected"):
         await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
         return
 
-    await _park_until_kyc(state)
     await _pending_kyc_notice(message, user_id)
 
 
@@ -583,7 +951,7 @@ async def handle_amount(
             )
             return
         logger.warning("alfabit create payment failed: %s", exc)
-        await creating.edit_text(f"⚠️ Не удалось создать платёж: {exc.message or exc.code}")
+        await creating.edit_text(f"⚠️ Не удалось создать платёж: {_user_message(exc)}")
         return
 
     if payment.get("status") == "kyc_required":

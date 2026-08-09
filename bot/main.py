@@ -6,7 +6,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import load_config
-from handlers import start, rates, orders, catalog, payment
+from handlers import start, rates, orders, catalog, fallback, payment
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.alfabit.client import AlfabitClient
@@ -34,7 +34,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     rate_cache = RateCache()
-    rapira_provider = RapiraProvider()
+    rapira_provider = RapiraProvider(markup=config.rapira_usdt_markup)
     usd_provider: RateProvider = InvestingComProvider(chrome_binary=config.chrome_binary_path)
     if config.twelvedata_api_key:
         usd_provider = FallbackProvider(primary=usd_provider, secondary=TwelveDataProvider(api_key=config.twelvedata_api_key))
@@ -103,6 +103,8 @@ async def main() -> None:
     dp.include_router(payment.router)
     dp.include_router(orders.router)
     dp.include_router(catalog.router)
+    # Строго последним: ловит всё, что не подошло хендлерам выше.
+    dp.include_router(fallback.router)
 
     logger.info("Loading initial data...")
     initial_tasks = [
