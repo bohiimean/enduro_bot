@@ -16,6 +16,17 @@ router = Router()
 _MAX_DESC_LEN = 900
 
 
+async def _safe_delete(message: Message) -> None:
+    """Telegram не даёт удалять сообщения старше 48 часов. Пользователь,
+    вернувшийся к вчерашнему каталогу, получал исключение вместо меню —
+    следующая строка хендлера просто не выполнялась, и кнопка выглядела
+    мёртвой."""
+    try:
+        await message.delete()
+    except TelegramBadRequest as exc:
+        logger.info("Не удалось удалить сообщение каталога: %s", exc)
+
+
 def _build_caption(item: dict) -> str:
     название = item.get("название", "—")
     описание = item.get("описание", "")
@@ -74,7 +85,7 @@ async def cb_catalog_back(query: CallbackQuery, catalog_cache: CatalogCache) -> 
     page = int(parts[2])
     list_msg_id = int(parts[3])
     await query.answer()
-    await query.message.delete()
+    await _safe_delete(query.message)
 
     items = catalog_cache.all_items()
     if not items:
@@ -135,7 +146,7 @@ async def cb_item(
 @router.callback_query(F.data == "cat:menu")
 async def cb_catalog_menu(query: CallbackQuery) -> None:
     await query.answer()
-    await query.message.delete()
+    await _safe_delete(query.message)
     await query.message.answer("Выберите действие:", reply_markup=main_keyboard)
 
 
