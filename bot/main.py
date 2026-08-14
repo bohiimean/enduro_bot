@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import load_config
 from handlers import start, rates, orders, catalog, fallback, payment
+from middlewares.private_only import PrivateOnlyMiddleware
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.alfabit.client import AlfabitClient
@@ -97,6 +98,12 @@ async def main() -> None:
     dp["alfabit_payer_ip"] = alfabit_payer_ip
     if config.manager_tg_chat_id is None:
         logger.warning("MANAGER_TG_CHAT_ID не задан — уведомления об оплате только в лог")
+
+    # Строго до роутеров: групповые апдейты отбрасываются, не доходя до
+    # маршрутизации. Иначе catch-all из handlers/fallback.py отвечает в любом
+    # чате, куда бота занесло, а сценарий оплаты спрашивает телефон и паспорт
+    # при свидетелях. Подробности — в middlewares/private_only.py.
+    dp.update.outer_middleware(PrivateOnlyMiddleware())
 
     dp.include_router(start.router)
     dp.include_router(rates.router)
