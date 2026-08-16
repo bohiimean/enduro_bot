@@ -7,10 +7,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import load_config
 from handlers import start, rates, orders, catalog, fallback, payment
+from handlers.errors import on_unhandled_error
+from handlers.payment import notify_kyc_resolved
 from middlewares.private_only import PrivateOnlyMiddleware
 from services.catalog_cache import CatalogCache
 from services.drive_photos import DrivePhotoCache
 from services.alfabit.client import AlfabitClient
+from services.kyc_watch import POLL_INTERVAL_SECONDS, KycWatcher, Watch
 from services.rate_cache import RateCache
 from services.rate_providers.alfabit import AlfabitWidgetProvider
 from services.rate_providers.base import RateProvider
@@ -32,7 +35,10 @@ async def main() -> None:
     config = load_config()
 
     bot = Bot(token=config.bot_token)
-    dp = Dispatcher(storage=MemoryStorage())
+    # Хранилище держим переменной: фоновое уведомление о результате верификации
+    # собирает FSMContext само, без входящего апдейта (handlers/payment.py).
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
 
     rate_cache = RateCache()
     rapira_provider = RapiraProvider(markup=config.rapira_usdt_markup)
@@ -51,6 +57,7 @@ async def main() -> None:
     # без них строка QR+KYC просто не показывается.
     alfabit_client: AlfabitClient | None = None
     alfabit_payer_ip: str | None = None
+    kyc_watcher: KycWatcher | None = None
     if config.alfabit_api_key and config.alfabit_secret_key:
         alfabit_client = AlfabitClient(
             api_key=config.alfabit_api_key,
@@ -74,6 +81,14 @@ async def main() -> None:
             logger.info("Alfabit payer_ip: %s", alfabit_payer_ip)
         else:
             logger.warning("Alfabit payer_ip неизвестен — checkout будет недоступен")
+
+        # Вебхука на смену KYC у Alfabit нет, поэтому заявки досматриваются
+        # опросом. Без этого результат верификации ждал, пока пользователь сам
+        # нажмёт кнопку в меню, — и до одного из клиентов не дошёл за двое суток.
+        async def on_kyc_resolved(watch: Watch, payer: dict) -> None:
+            await notify_kyc_resolved(bot, storage, watch, payer)
+
+        kyc_watcher = KycWatcher(alfabit_client, on_kyc_resolved)
     else:
         logger.info("Alfabit keys not set — QR+KYC rate disabled")
     sheets_cache = SheetsCache(
@@ -96,6 +111,7 @@ async def main() -> None:
     dp["manager_tg_chat_id"] = config.manager_tg_chat_id
     dp["alfabit_client"] = alfabit_client
     dp["alfabit_payer_ip"] = alfabit_payer_ip
+    dp["kyc_watcher"] = kyc_watcher
     if config.manager_tg_chat_id is None:
         logger.warning("MANAGER_TG_CHAT_ID не задан — уведомления об оплате только в лог")
 
@@ -112,6 +128,9 @@ async def main() -> None:
     dp.include_router(catalog.router)
     # Строго последним: ловит всё, что не подошло хендлерам выше.
     dp.include_router(fallback.router)
+    # Последняя сеть: всё, что упало мимо except в хендлерах, попадает в лог с
+    # user_id, а пользователь получает ответ вместо тишины.
+    dp.errors.register(on_unhandled_error)
 
     logger.info("Loading initial data...")
     initial_tasks = [
@@ -153,6 +172,12 @@ async def main() -> None:
             trigger="interval",
             minutes=20,
             args=["usdt_rub_alfabit"],
+        )
+    if kyc_watcher is not None:
+        scheduler.add_job(
+            kyc_watcher.tick,
+            trigger="interval",
+            seconds=POLL_INTERVAL_SECONDS,
         )
     scheduler.start()
 

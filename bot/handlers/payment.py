@@ -24,12 +24,23 @@ Alfabit означает заявку в вечном pending, из которо
 - на этих шагах у пользователя видна только «Отмена»;
 - любое сообщение, не подошедшее ни одному хендлеру, ловит handlers/fallback.py,
   чтобы фото паспорта не пропадало молча.
+
+Результат верификации приходит человеку сам: заявка встаёт под наблюдение
+(services/kyc_watch.py) и досматривается до approved/rejected. Раньше бот
+опрашивал статус 20 секунд после загрузки и замолкал — одобрение, пришедшее
+минутой позже, не доходило никогда, а человек считал, что верификация зависла.
+
+Три разных «pending» различаются по полям ответа Alfabit и звучат по-разному:
+processing=true — идёт распознавание; manual_review=true — заявку забрал
+оператор (тогда переотправка тех же файлов запрещена докой и кнопки повтора
+здесь нет); всё остальное — мы ждём от человека недостающий документ.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
@@ -38,6 +49,7 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -56,6 +68,8 @@ from handlers.start import (
     main_keyboard,
 )
 from services.alfabit.client import TRANSPORT_ERROR_CODES, AlfabitClient, AlfabitError
+from services.kyc_trace import log_payer, log_upload
+from services.kyc_watch import KycWatcher, Watch
 from services.rate_cache import RateCache
 from services.yuan import yuan_price
 from utils.phone import normalize_phone
@@ -201,13 +215,26 @@ async def _back_to_menu(message: Message, state: FSMContext, text: str) -> None:
     await message.answer(text, reply_markup=main_keyboard)
 
 
-async def _park_until_kyc(state: FSMContext) -> None:
+async def _park_until_kyc(
+    state: FSMContext,
+    watcher: KycWatcher | None,
+    *,
+    user_id: int,
+    chat_id: int,
+    phone: str,
+) -> None:
     """Документы на проверке: выходим из шага, чтобы пользователь свободно
     ходил по боту, но телефон в данных оставляем — по нему кнопка «Статус
     верификации» узнаёт, чью заявку проверять. Хранилище FSM — in-memory,
     так что связка живёт до перезапуска процесса; после него кнопка честно
-    предложит начать оплату заново."""
+    предложит начать оплату заново.
+
+    Заодно ставим заявку под наблюдение: ждать, пока человек сам нажмёт кнопку,
+    больше не нужно — результат придёт ему сам (services/kyc_watch.py).
+    """
     await state.set_state(None)
+    if watcher is not None:
+        watcher.watch(user_id, chat_id, phone)
 
 
 def _is_exit(text: str) -> bool:
@@ -234,12 +261,17 @@ _status_messages: dict[int, int] = {}
 _STATUS_LIMIT = 500
 
 
-async def _clear_status(message: Message, user_id: int) -> None:
+async def _clear_status(bot: Bot, chat_id: int, user_id: int) -> None:
+    """Убрать предыдущее сообщение о статусе.
+
+    Принимает bot/chat_id, а не Message: то же самое делает фоновое уведомление
+    о результате верификации, у которого никакого входящего сообщения нет.
+    """
     old = _status_messages.pop(user_id, None)
     if old is None:
         return
     try:
-        await message.bot.delete_message(message.chat.id, old)
+        await bot.delete_message(chat_id, old)
     except TelegramBadRequest:
         # Сообщение уже удалено пользователем или слишком старое — не мешает.
         pass
@@ -258,7 +290,7 @@ async def _replace_status(
     и человек остаётся без клавиатуры вообще. Всё, что ставит меню, шлётся через
     _menu_message и не удаляется никогда.
     """
-    await _clear_status(message, user_id)
+    await _clear_status(message.bot, message.chat.id, user_id)
     sent = await message.answer(text, parse_mode="HTML", reply_markup=markup)
     if user_id not in _status_messages and len(_status_messages) >= _STATUS_LIMIT:
         _status_messages.pop(next(iter(_status_messages)))
@@ -270,7 +302,7 @@ async def _menu_message(
 ) -> None:
     """Сообщение, которое (пере)ставит меню. Как статусное не регистрируется —
     удалять его нельзя, вместе с ним исчезнет клавиатура."""
-    await _clear_status(message, user_id)
+    await _clear_status(message.bot, message.chat.id, user_id)
     await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 
@@ -287,17 +319,123 @@ def _redo_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _pending_kyc_notice(message: Message, user_id: int) -> None:
+def _quality_hint(payer: dict, low_conf: Sequence[str] = ()) -> str:
+    """Всё, что Alfabit сообщает о качестве снимков — а сообщает он мало.
+
+    Прямой причины отказа в API нет. Есть два косвенных признака: low_confidence
+    в ответе на загрузку («распозналось плохо») и пустой expected_payer_name
+    после распознавания — значит, ФИО с главной страницы прочитать не удалось.
+    Оба до сих пор молча выбрасывались, хотя это единственное, что можно сказать
+    человеку до того, как заявка уйдёт к оператору на сутки.
+    """
+    if low_conf:
+        pages = ", ".join(_DOC_SLOTS[doc][2] for doc in low_conf if doc in _DOC_SLOTS)
+        return (
+            f"\n\n⚠️ Сервис отметил, что фото {pages} читается плохо. "
+            "Если проверка не пройдёт — переснимите эту страницу при хорошем "
+            "свете, без бликов, чтобы края попали в кадр."
+        )
+    if payer.get("manual_review") and not payer.get("expected_payer_name"):
+        return (
+            "\n\n⚠️ С главной страницы паспорта не удалось считать ФИО — обычно "
+            "дело в качестве снимка: блики, смазано или обрезан край."
+        )
+    return ""
+
+
+def _waiting_text(payer: dict, low_conf: Sequence[str] = ()) -> str:
+    """Честный текст ожидания. Раньше на все случаи был один — «это может
+    занять время», из-за чего ручная сверка выглядела так же, как недошедший
+    документ."""
+    if payer.get("manual_review"):
+        text = (
+            "⏳ <b>Документы проверяет сотрудник.</b>\n\n"
+            "Автоматическая проверка не смогла принять решение сама и передала "
+            "заявку человеку — это дольше обычного.\n\n"
+            "Присылать те же фото заново не нужно: повторная отправка проверку "
+            "не ускорит. Как только она закончится, я напишу сюда сам."
+        )
+    else:
+        text = (
+            "⏳ <b>Документы на проверке.</b>\n\n"
+            "Обычно это занимает меньше минуты. Как только проверка закончится, "
+            "я напишу сюда сам — держать бота открытым не нужно."
+        )
+    return text + _quality_hint(payer, low_conf)
+
+
+async def _pending_kyc_notice(
+    message: Message, user_id: int, payer: dict, low_conf: Sequence[str] = ()
+) -> None:
     """Документы ушли на проверку — дальше пользователь ждёт в меню.
 
     Это сообщение и ставит меню с кнопкой статуса, поэтому оно из неудаляемых.
+    Кнопка остаётся как ручной способ проверить, но ключевого значения больше
+    не имеет: результат придёт сам.
     """
     await _menu_message(
         message,
         user_id,
-        "⏳ Документы ушли на дополнительную проверку — это может занять время.\n\n"
-        f"Нажмите «{BTN_KYC_STATUS}» в меню, чтобы узнать результат.",
+        _waiting_text(payer, low_conf)
+        + f"\n\nПроверить статус вручную — кнопка «{BTN_KYC_STATUS}» в меню.",
         kyc_menu_keyboard,
+    )
+
+
+async def notify_kyc_resolved(
+    bot: Bot, storage: BaseStorage, watch: Watch, payer: dict
+) -> None:
+    """Верификация закрылась, пока человек занимался своими делами.
+
+    Зовётся из services/kyc_watch.py, входящего сообщения здесь нет — поэтому
+    FSMContext собираем руками по тому же ключу, каким его строит aiogram для
+    приватного чата.
+
+    Если пользователь сейчас в другом сценарии (вводит телефон для статуса
+    заказа, например), состояние не трогаем: перебить чужой шаг радостной
+    новостью — тот самый класс ошибок, из-за которого 08.08 терялись документы.
+    Тогда просто сообщаем результат, а к шагу суммы человек вернётся сам.
+    """
+    user_id, chat_id = watch.user_id, watch.chat_id
+    log_payer("resolved in background", user_id=user_id, phone=watch.phone, payer=payer)
+    _uploaded_docs.pop(watch.phone, None)
+
+    state = FSMContext(
+        storage=storage,
+        key=StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id),
+    )
+    busy = await state.get_state() is not None
+    await _clear_status(bot, chat_id, user_id)
+
+    if payer.get("kyc_status") == "rejected":
+        if not busy:
+            await state.clear()
+        await bot.send_message(
+            chat_id,
+            "❌ <b>Верификация не пройдена.</b>\n\n"
+            "Свяжитесь с менеджером — оплату оформим вручную.",
+            parse_mode="HTML",
+            reply_markup=None if busy else main_keyboard,
+        )
+        return
+
+    if busy:
+        await bot.send_message(
+            chat_id,
+            "✅ <b>Верификация пройдена!</b>\n\n"
+            "Вернитесь к оплате через «💱 Купить Юань» — документы больше не нужны.",
+            parse_mode="HTML",
+        )
+        return
+
+    payer_name = payer.get("expected_payer_name")
+    await state.update_data(phone=watch.phone, payer_name=payer_name)
+    await state.set_state(PayStates.amount)
+    await bot.send_message(
+        chat_id,
+        _amount_prompt(payer_name),
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard,
     )
 
 
@@ -331,7 +469,7 @@ async def redo_documents(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PayStates.passport_main)
     await _clear_docs(state)
     _uploaded_docs.pop(phone, None)
-    await _clear_status(message, user_id)
+    await _clear_status(message.bot, message.chat.id, user_id)
     await message.answer(
         "Отправим документы заново. Пришлите фото <b>главной страницы паспорта</b>.",
         parse_mode="HTML",
@@ -358,6 +496,7 @@ async def kyc_status(
     message: Message,
     state: FSMContext,
     alfabit_client: AlfabitClient | None,
+    kyc_watcher: KycWatcher | None,
 ) -> None:
     """Зарегистрирован раньше FSM-хендлеров: кнопка живёт в меню и должна
     работать, в каком бы сценарии пользователь сейчас ни находился.
@@ -395,7 +534,7 @@ async def kyc_status(
     try:
         payer = await alfabit_client.get_payer(phone)
     except AlfabitError as exc:
-        logger.warning("alfabit get_payer status failed: %s", exc)
+        logger.warning("alfabit get_payer status failed: user=%s %s", user_id, exc)
         await _menu_message(
             message,
             user_id,
@@ -404,22 +543,40 @@ async def kyc_status(
         )
         return
 
-    # Идёт обработка — недостачу разбирать рано, что-то из документов сейчас
-    # как раз читают. Кнопку повтора здесь не показываем: переотправлять
-    # комплект посреди чтения незачем, а повод сбивает.
+    log_payer("status button", user_id=user_id, phone=phone, payer=payer)
+
+    # Кнопку жмут ровно тогда, когда результата ждут. Если заявка почему-то
+    # выпала из наблюдения (истёк срок, уведомление не доставилось), сейчас
+    # самое время вернуть её туда: телефон и чат под рукой.
+    if kyc_watcher is not None and payer.get("kyc_status") not in ("approved", "rejected"):
+        kyc_watcher.watch(user_id, message.chat.id, phone)
+
+    # Идёт распознавание — недостачу разбирать рано, документы сейчас как раз
+    # читают. Кнопки повтора здесь нет: переотправлять комплект посреди чтения
+    # незачем, а повод сбивает.
     if payer.get("processing"):
-        await _replace_status(message, user_id, "⏳ Проверка ещё идёт.")
+        await _replace_status(
+            message,
+            user_id,
+            "⏳ Идёт распознавание документов — это несколько секунд.\n"
+            "Результат придёт сюда сам.",
+        )
         return
 
-    # Alfabit держит pending, а недостачи мы не видим. Два случая неразличимы:
-    # идёт ручная сверка — или до сервиса дошла половина комплекта, а наша
-    # память об отправленном не пережила перезапуск процесса (_uploaded_docs).
-    #
-    # Кнопку сюда вернули 10.08.2026: без неё у второго случая нет выхода
-    # вообще. Реальный номер завис в pending больше суток, и все пути вели в
-    # это же «ждите» — ветка pending в _route_by_kyc после рестарта тоже видит
-    # пустой _missing_docs. Повторная загрузка того же doc_type идемпотентна,
-    # так что кнопка безопасна и когда сверка действительно идёт.
+    # Заявку забрал оператор. Дока про этот случай говорит прямо: «те же файлы
+    # заново не отправляйте», поэтому кнопки повтора здесь нет — раньше она
+    # висела именно тут и советовала ровно запрещённое. Живой случай
+    # 16.08.2026: pending + manual_review + пустой expected_payer_name, то есть
+    # ФИО не считалось и решение принимает человек.
+    if payer.get("manual_review"):
+        await _replace_status(message, user_id, _waiting_text(payer))
+        return
+
+    # Alfabit держит pending, оператор заявку не брал, а недостачи мы не видим.
+    # Скорее всего до сервиса дошла половина комплекта, а наша память об
+    # отправленном не пережила перезапуск процесса (_uploaded_docs). Здесь
+    # кнопка повтора уместна и безопасна: повторная загрузка того же doc_type
+    # дубликата не создаёт.
     if payer.get("kyc_status") == "pending" and not _missing_docs(phone):
         await _replace_status(
             message,
@@ -431,7 +588,9 @@ async def kyc_status(
         )
         return
 
-    await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
+    await _route_by_kyc(
+        message, state, payer, user_id=user_id, phone=phone, watcher=kyc_watcher
+    )
 
 
 # ---- Шаг 1: телефон -------------------------------------------------------
@@ -469,6 +628,7 @@ async def handle_phone(
     message: Message,
     state: FSMContext,
     alfabit_client: AlfabitClient | None,
+    kyc_watcher: KycWatcher | None,
 ) -> None:
     raw = message.contact.phone_number if message.contact else (message.text or "")
     if not message.contact and _is_exit(raw):
@@ -485,18 +645,29 @@ async def handle_phone(
         await _back_to_menu(message, state, "⚠️ Оплата сейчас недоступна.")
         return
 
+    user_id = message.from_user.id
     try:
         payer = await alfabit_client.get_payer(phone)
     except AlfabitError as exc:
-        logger.warning("alfabit get_payer failed: %s", exc)
+        logger.warning("alfabit get_payer failed: user=%s %s", user_id, exc)
         await _back_to_menu(message, state, "⚠️ Сервис оплаты не отвечает. Попробуйте позже.")
         return
 
-    await _route_by_kyc(message, state, payer, user_id=message.from_user.id, phone=phone)
+    log_payer("phone entered", user_id=user_id, phone=phone, payer=payer)
+    await _route_by_kyc(
+        message, state, payer, user_id=user_id, phone=phone, watcher=kyc_watcher
+    )
 
 
 async def _route_by_kyc(
-    message: Message, state: FSMContext, payer: dict, *, user_id: int, phone: str
+    message: Message,
+    state: FSMContext,
+    payer: dict,
+    *,
+    user_id: int,
+    phone: str,
+    watcher: KycWatcher | None = None,
+    low_conf: Sequence[str] = (),
 ) -> None:
     """Развилка по статусу верификации плательщика."""
     await state.update_data(phone=phone)
@@ -504,12 +675,16 @@ async def _route_by_kyc(
 
     if status == "approved":
         _uploaded_docs.pop(phone, None)
+        if watcher is not None:
+            watcher.forget(user_id)
         await _ask_amount(message, state, payer.get("expected_payer_name"), user_id)
         return
 
     if status == "rejected":
         _uploaded_docs.pop(phone, None)
-        await _clear_status(message, user_id)
+        if watcher is not None:
+            watcher.forget(user_id)
+        await _clear_status(message.bot, message.chat.id, user_id)
         await _back_to_menu(
             message,
             state,
@@ -518,12 +693,14 @@ async def _route_by_kyc(
         return
 
     if status == "pending":
-        # Alfabit держит в pending и когда идёт сверка, и когда ждёт документ.
-        # Различить это может только наша память о том, что мы отправляли.
-        missing = _missing_docs(phone)
+        # Alfabit держит в pending в трёх разных случаях. Ручную сверку он
+        # называет прямо (manual_review) — тогда документ от человека не нужен,
+        # ждёт оператор. В остальных случаях недостачу может показать только
+        # наша память о том, что мы отправляли.
+        missing = [] if payer.get("manual_review") else _missing_docs(phone)
         if missing:
             doc_type = missing[0]
-            await _clear_status(message, user_id)
+            await _clear_status(message.bot, message.chat.id, user_id)
             await _ask_again(
                 message,
                 state,
@@ -531,8 +708,10 @@ async def _route_by_kyc(
                 "Верификация не завершена: до сервиса дошла только часть документов.",
             )
             return
-        await _park_until_kyc(state)
-        await _pending_kyc_notice(message, user_id)
+        await _park_until_kyc(
+            state, watcher, user_id=user_id, chat_id=message.chat.id, phone=phone
+        )
+        await _pending_kyc_notice(message, user_id, payer, low_conf)
         return
 
     # not_started — просим документы. Если про номер что-то помнилось, сведения
@@ -540,7 +719,7 @@ async def _route_by_kyc(
     _uploaded_docs.pop(phone, None)
     await state.set_state(PayStates.passport_main)
     await _clear_docs(state)
-    await _clear_status(message, user_id)
+    await _clear_status(message.bot, message.chat.id, user_id)
     await message.answer(
         "Для оплаты нужна верификация: <b>главная страница паспорта</b> и "
         "<b>страница с пропиской</b>.\n\n"
@@ -678,6 +857,7 @@ async def handle_document(
     bot: Bot,
     alfabit_client: AlfabitClient | None,
     alfabit_payer_ip: str | None,
+    kyc_watcher: KycWatcher | None,
 ) -> None:
     """Оба шага загрузки — один хендлер: какую страницу сейчас ждём, решается
     ПОД замком, по актуальному состоянию.
@@ -733,7 +913,7 @@ async def handle_document(
         # же замком: лишнее фото, присланное следом, дождётся конца и получит
         # ответ, а не уедет третьим запросом.
         await _send_documents(
-            message, state, bot, alfabit_client, alfabit_payer_ip, user_id
+            message, state, bot, alfabit_client, alfabit_payer_ip, user_id, kyc_watcher
         )
 
 
@@ -757,6 +937,7 @@ async def _send_documents(
     alfabit_client: AlfabitClient | None,
     alfabit_payer_ip: str | None,
     user_id: int,
+    watcher: KycWatcher | None = None,
 ) -> None:
     """Отправляет собранный комплект в Alfabit.
 
@@ -774,6 +955,10 @@ async def _send_documents(
     data = await state.get_data()
     phone: str = data["phone"]
     uploaded: list[str] = list(data.get("uploaded") or [])
+    # Страницы, про которые Alfabit сказал «распозналось плохо». Поле приходит
+    # только в ответе на загрузку, в GET /payers его нет — не соберём здесь,
+    # больше не увидим нигде.
+    low_conf: list[str] = []
 
     status = await message.answer("⏳ Отправляем документы…")
 
@@ -806,7 +991,9 @@ async def _send_documents(
             await status.delete()
             if _is_access_error(exc):
                 # Прав у ключа нет — другое фото не поможет, не гоняем по кругу.
-                logger.error("alfabit upload %s: доступ запрещён (%s)", doc_type, exc)
+                logger.error(
+                    "alfabit upload %s: доступ запрещён user=%s (%s)", doc_type, user_id, exc
+                )
                 await _back_to_menu(
                     message,
                     state,
@@ -814,7 +1001,7 @@ async def _send_documents(
                     "оплату оформим вручную.",
                 )
                 return
-            logger.warning("alfabit upload %s failed: %s", doc_type, exc)
+            logger.warning("alfabit upload %s failed: user=%s %s", doc_type, user_id, exc)
             if exc.code in TRANSPORT_ERROR_CODES:
                 reason = "⚠️ Сервис верификации не отвечает — документ не отправился."
             else:
@@ -825,46 +1012,65 @@ async def _send_documents(
             await _ask_again(message, state, doc_type, reason)
             return
 
-        # Единственный след того, ЧТО именно уехало в Alfabit.
-        logger.info(
-            "KYC upload ok: user=%s doc_type=%s processing=%s",
-            user_id, doc_type, result.get("processing"),
-        )
+        # След того, ЧТО именно уехало в Alfabit и что он об этом сказал.
+        log_upload("upload ok", user_id=user_id, phone=phone, doc_type=doc_type, result=result)
+        if result.get("low_confidence"):
+            low_conf.append(doc_type)
         uploaded.append(doc_type)
         await state.update_data(uploaded=uploaded)
         # Данные FSM пропадут при «Отмене», а этот след — нет: по нему бот
         # узнает недостачу, даже если человек вернётся через час с чистого места.
         _remember_upload(phone, doc_type)
 
-    await _park_until_kyc(state)
+    await _park_until_kyc(
+        state, watcher, user_id=user_id, chat_id=message.chat.id, phone=phone
+    )
     await status.edit_text("⏳ Проверяем документы…")
-    payer = await _poll_kyc(alfabit_client, phone)
+    payer = await _poll_kyc(alfabit_client, phone, user_id=user_id)
     await status.delete()
 
     if payer is None:
         # Документы уже в Alfabit — важно вернуть меню с кнопкой статуса,
-        # иначе человек остаётся с одной «Отменой» и без пути назад.
+        # иначе человек остаётся с одной «Отменой» и без пути назад. Заявка при
+        # этом под наблюдением: результат придёт сам, когда сервис ответит.
         await message.answer(
             "⚠️ Сервис проверки не отвечает, но документы отправлены.\n"
-            f"Результат посмотрите кнопкой «{BTN_KYC_STATUS}» в меню.",
+            "Как только он ответит, я пришлю результат сюда. Проверить вручную — "
+            f"кнопка «{BTN_KYC_STATUS}» в меню.",
             reply_markup=kyc_menu_keyboard,
         )
         return
+
+    log_payer("after upload", user_id=user_id, phone=phone, payer=payer)
     if payer.get("kyc_status") in ("approved", "rejected"):
-        await _route_by_kyc(message, state, payer, user_id=user_id, phone=phone)
+        await _route_by_kyc(
+            message,
+            state,
+            payer,
+            user_id=user_id,
+            phone=phone,
+            watcher=watcher,
+            low_conf=low_conf,
+        )
         return
 
-    await _pending_kyc_notice(message, user_id)
+    await _pending_kyc_notice(message, user_id, payer, low_conf)
 
 
-async def _poll_kyc(client: AlfabitClient, phone: str) -> dict | None:
-    """Опрашивает статус, пока processing=true. None — если API недоступен."""
+async def _poll_kyc(client: AlfabitClient, phone: str, *, user_id: int) -> dict | None:
+    """Опрашивает статус, пока processing=true. None — если API недоступен.
+
+    Короткая пачка на несколько секунд, как просит дока: распознавание обычно
+    успевает закончиться, пока человек ещё смотрит в чат. Всё, что не уложилось,
+    досматривает services/kyc_watch.py — раньше на этом месте наблюдение
+    заканчивалось совсем.
+    """
     payer: dict | None = None
     for attempt in range(_KYC_POLL_ATTEMPTS):
         try:
             payer = await client.get_payer(phone)
         except AlfabitError as exc:
-            logger.warning("alfabit get_payer poll failed: %s", exc)
+            logger.warning("alfabit get_payer poll failed: user=%s %s", user_id, exc)
             return payer
         if not payer.get("processing"):
             return payer
@@ -896,8 +1102,16 @@ async def _ask_amount(
     await state.update_data(payer_name=payer_name)
     await state.set_state(PayStates.amount)
     # Убираем «проверка ещё идёт» — её место занимает сообщение об успехе.
-    await _clear_status(message, user_id)
+    await _clear_status(message.bot, message.chat.id, user_id)
 
+    await message.answer(
+        _amount_prompt(payer_name), parse_mode="HTML", reply_markup=_cancel_keyboard
+    )
+
+
+def _amount_prompt(payer_name: str | None) -> str:
+    """Общий текст для обоих путей к шагу суммы: пользователь пришёл сам или
+    верификация закрылась фоном и бот написал первым."""
     lines = ["✅ <b>Верификация пройдена.</b>"]
     if payer_name:
         lines.append(f"Плательщик: <b>{payer_name}</b>")
@@ -905,7 +1119,7 @@ async def _ask_amount(
         "",
         "Сколько юаней вы хотите купить? Введите число, например <code>5000</code>.",
     ]
-    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=_cancel_keyboard)
+    return "\n".join(lines)
 
 
 @router.message(PayStates.amount)
@@ -916,6 +1130,7 @@ async def handle_amount(
     rate_cache: RateCache,
     alfabit_client: AlfabitClient | None,
     alfabit_payer_ip: str | None,
+    kyc_watcher: KycWatcher | None,
 ) -> None:
     text = (message.text or "").strip()
     if _is_exit(text):
@@ -961,32 +1176,57 @@ async def handle_amount(
     except AlfabitError as exc:
         if _is_access_error(exc):
             # Внутренняя ошибка доступа — пользователю её текст ничего не даёт.
-            logger.error("alfabit create payment: доступ запрещён (%s)", exc)
+            logger.error(
+                "alfabit create payment: доступ запрещён user=%s ext=%s (%s)",
+                message.from_user.id, external_id, exc,
+            )
             await creating.edit_text(
                 "⚠️ Оплата сейчас недоступна. Напишите менеджеру — оформим вручную."
             )
             return
-        logger.warning("alfabit create payment failed: %s", exc)
+        logger.warning(
+            "alfabit create payment failed: user=%s ext=%s %s",
+            message.from_user.id, external_id, exc,
+        )
         await creating.edit_text(f"⚠️ Не удалось создать платёж: {_user_message(exc)}")
         return
 
     if payment.get("status") == "kyc_required":
+        # Профиль приёма требует верификацию, а плательщик её не прошёл. Сюда
+        # попадаем, если статус успел измениться между approved и созданием
+        # платежа — редко, но тогда возвращаемся в KYC-развилку.
         await creating.delete()
+        payer = {
+            "kyc_status": payment.get("payer_status", "not_started"),
+            "processing": payment.get("processing"),
+            "manual_review": payment.get("manual_review"),
+        }
+        log_payer("kyc_required on payment", user_id=message.from_user.id, phone=phone, payer=payer)
         await _route_by_kyc(
             message,
             state,
-            {"kyc_status": payment.get("payer_status", "not_started")},
+            payer,
             user_id=message.from_user.id,
             phone=phone,
+            watcher=kyc_watcher,
         )
         return
 
     uid = payment.get("payment_uid")
     if not uid:
-        logger.error("alfabit create payment: нет payment_uid в ответе %s", payment)
+        logger.error(
+            "alfabit create payment: нет payment_uid user=%s ext=%s ответ=%s",
+            message.from_user.id, external_id, payment,
+        )
         await creating.edit_text("⚠️ Сервис оплаты вернул неожиданный ответ. Напишите менеджеру.")
         return
 
+    # Связка «наш номер заявки ↔ платёж у Alfabit ↔ пользователь»: без неё
+    # платёж в кабинете не сопоставить с человеком в чате.
+    logger.info(
+        "payment created: user=%s ext=%s uid=%s amount=%s RUB (%s CNY)",
+        message.from_user.id, external_id, uid, f"{rub:.2f}", cny,
+    )
     _remember(uid, PaymentContext(
         user_id=message.from_user.id,
         username=message.from_user.username,

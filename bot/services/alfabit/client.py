@@ -77,6 +77,18 @@ class AlfabitClient:
         }
 
     @staticmethod
+    def _path_phone(phone: str) -> str:
+        """Телефон для URL — только цифры.
+
+        Дока требует явно: «в path телефона "+" не ставьте (иначе + декодируется
+        как пробел): /payers/79001234567, не /payers/+79001234567». Проверено
+        16.08.2026 — сейчас сервер принимает обе формы и отдаёт одну и ту же
+        запись, но полагаться на это незачем. В JSON-теле «+» оставляем, там он
+        разрешён и нормализуется на их стороне.
+        """
+        return "".join(ch for ch in phone if ch.isdigit())
+
+    @staticmethod
     def _signed_path(path: str, params: dict[str, Any] | None) -> str:
         """Путь для подписи. Query включаем в подпись (см. OPEN QUESTIONS)."""
         if not params:
@@ -208,8 +220,15 @@ class AlfabitClient:
         return await self._request("GET", f"/v1/integration/checkout/payments/{uid}")
 
     async def get_payer(self, phone: str) -> dict[str, Any]:
-        """GET /api/v1/integration/checkout/payers/{phone} — статус KYC плательщика."""
-        return await self._request("GET", f"/v1/integration/checkout/payers/{phone}")
+        """GET /api/v1/integration/checkout/payers/{phone} — статус KYC плательщика.
+
+        Отдаёт kyc_status (not_started|pending|approved|rejected), processing,
+        manual_review и expected_payer_name. Поля processing и manual_review
+        различают три разных «pending»: идёт распознавание, заявку забрал
+        оператор, ждём документ.
+        """
+        path_phone = self._path_phone(phone)
+        return await self._request("GET", f"/v1/integration/checkout/payers/{path_phone}")
 
     async def upload_payer_document(
         self,
@@ -228,8 +247,13 @@ class AlfabitClient:
         Ответ отдаётся сразу с processing=true — финальный статус забирать
         опросом get_payer(phone). Повторная загрузка того же doc_type безопасна.
         Подпись — с пустым body (проверено, см. модульный docstring).
+
+        В ответе приходит low_confidence: «распозналось плохо». Это единственное
+        место, где сервис говорит про качество снимка — в GET /payers поля нет,
+        так что второго шанса его увидеть не будет.
         """
-        path = _API_PREFIX + f"/v1/integration/checkout/payers/{phone}/documents"
+        path_phone = self._path_phone(phone)
+        path = _API_PREFIX + f"/v1/integration/checkout/payers/{path_phone}/documents"
         headers = self._sign("POST", path, "")
         form = aiohttp.FormData()
         form.add_field("doc_type", doc_type)
