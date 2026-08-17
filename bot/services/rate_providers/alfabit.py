@@ -49,7 +49,7 @@ class AlfabitWidgetProvider(RateProvider):
         self,
         client: AlfabitClient,
         direction: str = "buy",
-        markup: Decimal = Decimal("1.006"),
+        markup: Decimal = Decimal("1.007"),
         base_url: str = "https://alfabit.org",
         fiat: str = "RUB",
         crypto: str = "USDT",
