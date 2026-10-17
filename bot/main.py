@@ -108,6 +108,7 @@ async def main() -> None:
     dp["catalog_cache"] = catalog_cache
     dp["drive_cache"] = drive_cache
     dp["manager_tg_username"] = config.manager_tg_username
+    dp["rapira_usdt_markup"] = config.rapira_usdt_markup
     dp["manager_tg_chat_id"] = config.manager_tg_chat_id
     dp["alfabit_client"] = alfabit_client
     dp["alfabit_payer_ip"] = alfabit_payer_ip

@@ -17,6 +17,9 @@ _CACHE_KEY_USDT = "usdt_rub"
 _CACHE_KEY_ALFABIT = "usdt_rub_alfabit"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
+# Наличные: чистый USDT/RUB Rapira (без наценки QR) + фиксированная надбавка
+# в рублях, затем тот же делитель юаня. Формула клиента, 17.10.2026.
+_CASH_SURCHARGE_RUB = Decimal("1.3")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _LOADING_FRAMES = [
@@ -46,6 +49,7 @@ def _fmt(rate: Decimal) -> str:
 async def cmd_rates(
     message: Message,
     rate_cache: RateCache,
+    rapira_usdt_markup: Decimal,
 ) -> None:
     loading = await message.answer(_LOADING_FRAMES[0])
     anim_task = asyncio.create_task(_animate_loading(loading))
@@ -82,6 +86,16 @@ async def cmd_rates(
         "",
         "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(yuan_price(usdt_entry.rate))} ₽",
+        "",
+    ]
+
+    # В кеше курс Rapira уже с наценкой QR — снимаем её обратно, чтобы обе
+    # строки считались от одного снимка биржи.
+    rapira_raw = usdt_entry.rate / rapira_usdt_markup
+    lines += [
+        "<b>Курс наличные (Юань/Руб):</b>",
+        f"→ {_fmt(yuan_price(rapira_raw + _CASH_SURCHARGE_RUB))} ₽",
+        "<i>(курс приблизительный, так же может отличаться от суммы)</i>",
         "",
     ]
 
