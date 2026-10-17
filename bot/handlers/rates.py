@@ -8,13 +8,12 @@ from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from handlers.payment import payment_entry_keyboard
 from services.rate_cache import RateCache
-from services.usd_markup import MOSCOW_TZ, get_usd_rate_info
-from services.yuan import DIVISOR, FACTOR, yuan_price
+from services.usd_markup import MOSCOW_TZ
+from services.yuan import DIVISOR, yuan_price
 
 router = Router()
 
 _CACHE_KEY_USDT = "usdt_rub"
-_CACHE_KEY_USD = "usd_rub"
 _CACHE_KEY_ALFABIT = "usdt_rub_alfabit"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
@@ -43,15 +42,10 @@ def _fmt(rate: Decimal) -> str:
     return f"{rate:.2f}"
 
 
-def _usd_result(base: Decimal, markup: Decimal) -> Decimal:
-    return (FACTOR * (base + markup)).quantize(Decimal("0.01"))
-
-
 @router.message(F.text == "💱 Купить Юань")
 async def cmd_rates(
     message: Message,
     rate_cache: RateCache,
-    manager_tg_username: str,
 ) -> None:
     loading = await message.answer(_LOADING_FRAMES[0])
     anim_task = asyncio.create_task(_animate_loading(loading))
@@ -61,7 +55,6 @@ async def cmd_rates(
         if rate_cache.is_registered(_CACHE_KEY_ALFABIT):
             await rate_cache.refresh(_CACHE_KEY_ALFABIT, max_age_seconds=_USDT_MAX_AGE)
         usdt_entry = rate_cache.get(_CACHE_KEY_USDT)
-        usd_entry = rate_cache.get(_CACHE_KEY_USD)
         alfabit_entry = rate_cache.get(_CACHE_KEY_ALFABIT)
     finally:
         anim_task.cancel()
@@ -70,15 +63,13 @@ async def cmd_rates(
         except asyncio.CancelledError:
             pass
 
-    if usdt_entry is None or usd_entry is None:
+    if usdt_entry is None:
         await loading.edit_text("⚠️ Курс пока не загружен, попробуйте через минуту.")
         return
 
     keyboard: InlineKeyboardMarkup | None = None
     now = datetime.now(tz=timezone.utc)
     moscow = now.astimezone(MOSCOW_TZ)
-    usd_info = get_usd_rate_info(now)
-    base_usd = usd_entry.rate
 
     day = _WEEKDAYS[moscow.weekday()]
     date_str = moscow.strftime("%d.%m")
@@ -107,35 +98,16 @@ async def cmd_rates(
         ]
         keyboard = payment_entry_keyboard()
 
-    lines += [
-        "<b>Наличные в Москве</b>",
-        "+ дистанционное снятие по QR с вашего банка.",
-        "(Юань/Руб):",
-        f"→ Любая сумма — {_fmt(_usd_result(base_usd, usd_info.standard.markup))} ₽",
-        "",
-        "<b>VIP курс действует с 12:30 до 16:00 в будний день</b>",
-    ]
-
-    for tier in usd_info.discount_tiers:
-        lines.append(f"→ {tier.label} — {_fmt(_usd_result(base_usd, tier.markup))} ₽")
-
-    username = manager_tg_username.lstrip("@")
-    manager_link = f'<a href="https://t.me/{username}">менеджер</a>' if username else "менеджер"
-
-    lines.extend([
-        "",
-        "<i>(Курс доллара скачет каждую секунду и не фиксируется до момента передачи денег)</i>",
-        "",
-        f"Место и время сделки поможет выбрать {manager_link}.",
-    ])
+    # Наличные в Москве убраны из сообщения по просьбе клиента (30.09.2026).
+    # USD/RUB по-прежнему обновляется в main.py, но здесь не читается —
+    # его сбой больше не должен скрывать курс целиком.
+    while lines and lines[-1] == "":
+        lines.pop()
 
     stale = []
     if time.time() - usdt_entry.fetched_at > _TTL_STALE_WARN:
         t = datetime.fromtimestamp(usdt_entry.fetched_at, tz=MOSCOW_TZ).strftime("%H:%M")
         stale.append(f"⚠️ Юань/RUB: данные на {t}, не удалось обновить")
-    if time.time() - usd_entry.fetched_at > _TTL_STALE_WARN:
-        t = datetime.fromtimestamp(usd_entry.fetched_at, tz=MOSCOW_TZ).strftime("%H:%M")
-        stale.append(f"⚠️ USD/RUB: данные на {t}, не удалось обновить")
 
     if stale:
         lines.append("")
