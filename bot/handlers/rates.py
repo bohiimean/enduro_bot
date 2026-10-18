@@ -18,8 +18,9 @@ _CACHE_KEY_ALFABIT = "usdt_rub_alfabit"
 _TTL_STALE_WARN = 1800
 _USDT_MAX_AGE = 180
 # Наличные: чистый USDT/RUB Rapira (без наценки QR) + фиксированная надбавка
-# в рублях, затем тот же делитель юаня. Формула клиента, 17.10.2026.
-_CASH_SURCHARGE_RUB = Decimal("1.3")
+# в рублях, затем тот же делитель юаня. Формула клиента, 17.10.2026;
+# надбавка 1.3 → 1.15 ₽ 18.10.2026.
+_CASH_SURCHARGE_RUB = Decimal("1.15")
 
 _WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _LOADING_FRAMES = [
