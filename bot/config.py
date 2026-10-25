@@ -50,7 +50,7 @@ def load_config() -> Config:
     # примерно на 2%, это цена продажи USDT, не наша.
     alfabit_rate_direction = os.environ.get("ALFABIT_RATE_DIRECTION", "buy")
     # +1.75% сверх курса витрины alfabit (спред конвертера + комиссия метода
-    # оплаты уже внутри курса) — цена юаня по QR+KYC = курс/6.62 × 1.0175.
+    # оплаты уже внутри курса) — цена юаня по QR+KYC = курс/6.6 × 1.0175.
     # Дефолт не 1.0 намеренно: если переменную забыть в .env на сервере,
     # наценка не должна молча пропасть.
     alfabit_usdt_markup = Decimal(os.environ.get("ALFABIT_USDT_MARKUP", "1.0175"))

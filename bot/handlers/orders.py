@@ -56,6 +56,8 @@ async def handle_phone(message: Message, state: FSMContext, sheets_cache: Sheets
         brand = order.get("Марка", "—")
         model = order.get("Модель", "—")
         color = order.get("Цвет", "—")
+        qty = order.get("кол-во")
+        qty = f"{qty} шт." if qty else "—"
         price = order.get("Остаток", "—")
         status = order.get("Статус поставки") or "—"
         date = order.get("дата") or "—"
@@ -71,6 +73,7 @@ async def handle_phone(message: Message, state: FSMContext, sheets_cache: Sheets
         lines.append(f"<b>Телефон:</b> {phone}")
         lines.append(f"<b>Город:</b> {city}")
         lines.append(f"<b>ТК:</b> {tk}")
+        lines.append(f"<b>Кол-во:</b> {qty}")
         lines.append(f"<b>Остаток:</b> {price}")
         lines.append(f"<b>Статус:</b> {status}")
         lines.append(f"<b>Дата заказа:</b> {date}")
