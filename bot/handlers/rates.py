@@ -83,7 +83,7 @@ async def cmd_rates(
     lines = [
         f"💱 <b><u>Курс на {date_str} ({day}, {time_str})</u></b>",
         "",
-        f"<b>Курс (юань/руб): — {DIVISOR}</b>",
+        f"<b>Курс (юань/USDT): — {DIVISOR}</b>",
         "",
         "<b>QR-оплата (Юань/Руб):</b>",
         f"→ {_fmt(yuan_price(usdt_entry.rate))} ₽",
